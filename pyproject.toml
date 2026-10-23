@@ -36,6 +36,9 @@ ovirt = [
 openstack = [
     "openstacksdk>=4.0,<5",
 ]
+aws = [
+    "boto3>=1.40,<2",
+]
 test = [
     "pytest>=9.1.1",
 ]
