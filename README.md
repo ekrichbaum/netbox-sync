@@ -5,6 +5,7 @@ This is a tool to sync data from different sources to a NetBox instance.
 Available source types:
 * VMware vCenter Server
 * oVirt / Red Hat Virtualization (see [oVirt source](docs/source_ovirt.md))
+* OpenStack (optional `openstacksdk` dependency)
 * [bb-ricardo/check_redfish](https://github.com/bb-Ricardo/check_redfish) inventory files
 
 **IMPORTANT: READ INSTRUCTIONS CAREFULLY BEFORE RUNNING THIS PROGRAM**
@@ -42,6 +43,8 @@ This ensures stale objects are removed from NetBox keeping an accurate current s
 #### Source: oVirt (if used)
 * oVirt / Red Hat Virtualization Engine v4 API
 * Optional SDK and native libraries: see [installation and configuration](docs/source_ovirt.md)
+#### Source: OpenStack (if used)
+* Identity v3, Nova and Cinder APIs; `openstacksdk>=4.0,<5`
 
 # Installing
 * here we assume we install in ```/opt```
@@ -75,6 +78,34 @@ The `vcf-sdk` must be installed if tags should be synced from vCenter to NetBox
 ```shell
 pip install --upgrade vcf-sdk
 ```
+
+### OpenStack (optional)
+Install the optional SDK only when using an OpenStack source:
+```shell
+pip install -r requirements-openstack.txt
+# or, with uv:
+uv sync --extra openstack
+```
+
+Set `type = openstack` in a `[source/my-cloud]` section. The generated example
+includes Identity v3 URL, project, username/password, user/project domains and
+region settings. TLS verification is enabled by default. Set `permitted_subnets`
+explicitly; without it no IP addresses are imported. Start with a dry run (`-n`).
+
+Availability zones become clusters, hypervisors become devices, and servers become
+VMs with flavor resources, attached-volume capacity, interfaces, fixed/floating IPs
+and IPv4/IPv6 primary addresses. Existing NetBox prefixes supply masks, VRFs,
+tenants and VLANs. Filters and site/tenant/role/tag relations are supported, as are
+UUID-based VM names and SDK resource attributes as custom fields.
+
+The historical all-project discovery remains the default and requires access to
+Nova availability-zone details/hypervisors and Cinder volumes. `all_projects = false`
+limits server/volume queries to the authenticated project, but does not remove
+the need for hypervisor discovery permissions. Flavor details are fetched when
+Nova returns only a flavor ID. Floating addresses are attached to the matching
+MAC interface; fixed addresses are preferred for primary IPs. Multiple servers
+with the same name in a zone prefer the active server; use `set_vm_name_to_uuid`
+for otherwise indistinguishable VM names.
 
 ## NetBox API token
 In order to updated data in NetBox you need a NetBox API token.
