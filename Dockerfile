@@ -4,13 +4,24 @@ COPY requirements.txt .
 COPY requirements-aws.txt .
 
 ARG VENV=/opt/netbox-sync/venv
+ARG INSTALL_OVIRT=false
+COPY requirements-ovirt.txt .
 ARG INSTALL_AWS=false
+ARG INSTALL_OPENSTACK=false
+COPY requirements-openstack.txt .
 
 # Install dependencies
-RUN python3 -m venv $VENV && \
+RUN if [ "$INSTALL_OVIRT" = "true" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends gcc libc6-dev libxml2-dev libcurl4-openssl-dev && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi && \
+    python3 -m venv $VENV && \
     $VENV/bin/python3 -m pip install --upgrade pip && \
     $VENV/bin/pip install -r requirements.txt && \
+    if [ "$INSTALL_OVIRT" = "true" ]; then $VENV/bin/pip install -r requirements-ovirt.txt; fi && \
     if [ "$INSTALL_AWS" = "true" ]; then $VENV/bin/pip install -r requirements-aws.txt; fi && \
+    if [ "$INSTALL_OPENSTACK" = "true" ]; then $VENV/bin/pip install -r requirements-openstack.txt; fi && \
     $VENV/bin/pip install vmware-vcenter==9.1.1.0 && \
     $VENV/bin/python3 -m pip uninstall -y pip && \
     find $VENV -type d -name "__pycache__" -print0 | xargs -0 -n1 rm -rf
@@ -18,6 +29,7 @@ RUN python3 -m venv $VENV && \
 FROM python:3.14-slim AS netbox-sync
 
 ARG VENV=/opt/netbox-sync/venv
+ARG INSTALL_OVIRT=false
 
 # Copy installed packages
 COPY --from=builder $VENV $VENV
@@ -33,6 +45,9 @@ COPY . .
 # can use it)
 RUN apt-get update && \
     apt-get dist-upgrade -y && \
+    if [ "$INSTALL_OVIRT" = "true" ]; then \
+        apt-get install -y --no-install-recommends libxml2 libcurl4t64; \
+    fi && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m pip uninstall -y --root-user-action=ignore pip && \
     groupadd --gid 1000 netbox-sync && \

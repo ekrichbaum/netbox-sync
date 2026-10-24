@@ -30,6 +30,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ovirt = [
+    "ovirt-engine-sdk-python>=4.6,<5",
+]
+openstack = [
+    "openstacksdk>=4.0,<5",
+]
 aws = [
     "boto3>=1.40,<2",
 ]

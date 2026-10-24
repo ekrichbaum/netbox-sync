@@ -2,7 +2,7 @@ name: Test
 
 on:
   push:
-    branches: [ "main", "development", "AWS" ]
+    branches: [ "main", "development", "AWS", "consolidated-aws-ovirt-openstack" ]
   pull_request:
     branches: [ "main", "development" ]
   workflow_dispatch:
