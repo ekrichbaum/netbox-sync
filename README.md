@@ -5,7 +5,7 @@ This is a tool to sync data from different sources to a NetBox instance.
 Available source types:
 * VMware vCenter Server
 * oVirt / Red Hat Virtualization (see [oVirt source](docs/source_ovirt.md))
-* OpenStack (optional `openstacksdk` dependency)
+* OpenStack (optional `openstacksdk` dependency; see [OpenStack source](docs/source_openstack.md))
 * AWS EC2, EBS, and network interfaces (see [AWS source](docs/source_aws.md))
 * [bb-ricardo/check_redfish](https://github.com/bb-Ricardo/check_redfish) inventory files
 
@@ -46,6 +46,7 @@ This ensures stale objects are removed from NetBox keeping an accurate current s
 * Optional SDK and native libraries: see [installation and configuration](docs/source_ovirt.md)
 #### Source: OpenStack (if used)
 * Identity v3, Nova and Cinder APIs; `openstacksdk>=4.0,<5`
+* See [OpenStack installation and configuration](docs/source_openstack.md) for credentials, permissions, and inventory mapping
 #### Source: AWS (if used)
 * Optional boto3 SDK, AWS read-only credentials, and automatic or explicit region discovery
 * Optional AWS Organizations discovery with collector permissions and a trusted inventory role in each member account
