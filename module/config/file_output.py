@@ -20,6 +20,7 @@ from module.sources.hetzner.config import HetznerConfig
 from module.sources.ovirt.config import OVirtConfig
 from module.sources.openstack.config import OpenStackConfig
 from module.sources.aws.config import AWSConfig
+from module.sources.digitalocean.config import DigitalOceanConfig
 from module.common.logging import get_logger
 from module.config import default_config_file_path, source_config_section_name
 from module.config.files import ConfigFile, ConfigFileINI, ConfigFileYAML
