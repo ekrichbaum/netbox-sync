@@ -42,7 +42,8 @@ class ConfigFileOutput(DescriptionFormatterMixin):
         HetznerConfig,
         OVirtConfig,
         OpenStackConfig,
-        AWSConfig
+        AWSConfig,
+        DigitalOceanConfig
     ]
 
     header = f"Welcome to the {__description__} configuration file."
