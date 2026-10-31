@@ -835,6 +835,9 @@ class NetBoxObject:
                 read_from_netbox = True if secondary_key_value.get("id", 0) != 0 else False
                 secondary_key_value = self.get_display_name(data=secondary_key_value)
 
+            if secondary_key_value is None and include_secondary_key_if_present:
+                return my_name
+
             if secondary_key_value is None and read_from_netbox is False and include_secondary_key_if_present is False:
                 log.warning(f"Unable to determine second key '{secondary_key}' for {self.name} '{my_name}', "
                             f"got: {org_secondary_key_value}")
@@ -1896,6 +1899,7 @@ class NBCluster(NetBoxObject):
     object_type = "virtualization.cluster"
     primary_key = "name"
     secondary_key = "scope_id"
+    include_secondary_key_if_present = True
     prune = False
 
     def __init__(self, *args, **kwargs):
