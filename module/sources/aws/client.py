@@ -1,359 +1,557 @@
+# -*- coding: utf-8 -*-
+#  Copyright (c) 2020 - 2026 netbox-sync team. All rights reserved.
+#
+#  netbox-sync.py
+#
+#  This work is licensed under the terms of the MIT license.
+#  For a copy, see file LICENSE.txt included in this
+#  repository or visit: <https://opensource.org/licenses/MIT>.
+
+"""
+boto3-backed discovery client for the AWS source.
+
+AWS is queried read-only; this module never performs a write call against AWS.
+All discovery failures that are not a recognized authorization denial are
+raised as AWSDiscoveryError, which the source handler turns into a fatal exit
+(no NetBox writes or pruning for that run). Recognized authorization denials
+are tolerated: they are logged, recorded, and discovery of everything else
+continues - see tolerate_access_denied() and docs/source_aws.md.
+"""
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Optional
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:  # pragma: no cover - exercised via monkeypatching boto3 = None
+    boto3 = None
+    ClientError = Exception
 
 from module.common.logging import get_logger
 
 log = get_logger()
 
-try:
-    import boto3
-    from botocore.config import Config
-    from botocore.exceptions import BotoCoreError, ClientError
-except ModuleNotFoundError as exc:
-    if exc.name != "boto3":
-        raise
-    boto3 = None
+# Error codes AWS uses for an authorization denial, across the services this
+# source talks to. Anything else (expired/invalid credentials, throttling,
+# malformed requests, ...) is left fatal.
+AUTH_ERROR_CODES = {
+    "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
+    "AuthorizationError", "AuthorizationErrorException",
+    "Forbidden", "ForbiddenException",
+}
+
+MAX_ITEMS_PER_PAGE = 20
 
 
-class AWSDiscoveryError(RuntimeError):
-    """Discovery failed; do not reconcile this run with NetBox."""
+class AWSDiscoveryError(Exception):
+    """A fatal AWS discovery failure. The caller must not write to NetBox."""
 
 
 @dataclass(frozen=True)
 class AWSAccessCheck:
-    account: str | None
-    region: str | None
+    account: Optional[str]
+    region: Optional[str]
     service: str
-    resource: str | None
+    resource: Optional[str]
     operation: str
     denied: bool
 
 
 class AWSClient:
-    def __init__(self, profile=None, *, session=None):
+    # class-level fallbacks: tests monkeypatch __init__ to a no-op and still
+    # read these before any discovery call sets a real per-instance list.
+    access_denied = []
+    access_checks = []
+    account_names = {}
+
+    def __init__(self, profile=None):
         if boto3 is None:
-            raise AWSDiscoveryError("AWS SDK missing. Install dependencies from requirements-aws.txt.")
-        try:
-            self.session = session if session is not None else boto3.Session(profile_name=profile)
-        except BotoCoreError as exc:
-            raise AWSDiscoveryError(f"Unable to initialize AWS credentials: {exc}") from exc
-        self.account_names = {}
+            raise AWSDiscoveryError(
+                "the 'boto3' package is required for the AWS source; "
+                "install it with 'pip install -r requirements-aws.txt'"
+            )
+        self.session = boto3.Session(profile_name=profile) if profile else boto3.Session()
         self.access_denied = []
         self.access_checks = []
+        self.account_names = {}
+        self._tracked_scopes = {}
+
+    # -- access tracking ----------------------------------------------------
 
     def track_access(self, client, account, region, service):
-        def capture_resource(params, context, **kwargs):
-            context["netbox_sync_resource"] = next((
-                params[key] for key in ("Bucket", "clusterName", "FunctionName", "Resource", "name")
-                if key in params
-            ), None)
+        """
+        Record every call made through `client` as an AWSAccessCheck, scoped
+        to (account, region, service). Calling this again for the same client
+        instance replaces the scope used for subsequent calls; it does not
+        stack. Used where one client is reused across many scopes in a loop
+        (member-account assume-role calls during organization discovery).
+        """
+        key = id(client)
+        self._tracked_scopes[key] = (account, region, service)
+        if key not in getattr(self, "_hooked_clients", set()):
+            if not hasattr(self, "_hooked_clients"):
+                self._hooked_clients = set()
+            self._hooked_clients.add(key)
 
-        def record_access(model, parsed, context, **kwargs):
-            code = parsed.get("Error", {}).get("Code")
-            denied = code in (
-                "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
-                "AuthorizationError", "AuthorizationErrorException", "Forbidden", "ForbiddenException")
-            if code is None or denied or code in (
-                    "NoSuchTagSet", "ServerSideEncryptionConfigurationNotFoundError"):
-                check_account = parsed.get("Account", account) if model.name == "GetCallerIdentity" else account
-                self.access_checks.append(AWSAccessCheck(
-                    check_account, region, service, context.get("netbox_sync_resource"), model.name, denied))
+            def after_call(http_response, parsed, model, context, **kwargs):
+                # AWS service-level errors (including AccessDenied) surface here as a
+                # normal parsed response with an "Error" key; botocore raises the
+                # actual exception to the caller only after this event fires.
+                # after-call-error is for transport failures (DNS, timeouts, ...),
+                # not service-side denials, so it is deliberately not hooked here.
+                scope = self._tracked_scopes.get(key, (account, region, service))
+                operation = model.name if model else None
+                if not operation:
+                    return
+                error_code = (parsed or {}).get("Error", {}).get("Code")
+                denied = error_code in AUTH_ERROR_CODES
+                self.access_checks.append(AWSAccessCheck(*scope, None, operation, denied))
 
-        for event, handler in (
-                ("before-parameter-build.*.*", capture_resource), ("after-call.*.*", record_access)):
-            unique_id = f"netbox-sync-access-{event}"
-            client.meta.events.unregister(event, unique_id=unique_id)
-            client.meta.events.register(event, handler, unique_id=unique_id)
+            client.meta.events.register("after-call.*.*", after_call)
 
     @contextmanager
-    def tolerate_access_denied(self, account=None, region=None, service=None, resource=None):
+    def tolerate_access_denied(self, account, region=None, service=None, resource=None, operation=None):
+        """
+        Run a single AWS call, tolerating a recognized authorization denial:
+        logs it, records it in access_denied (coarse, deduplicated) and, when
+        `resource` or `operation` is given, in access_checks (fine-grained,
+        for permission-tag reconciliation), then suppresses the exception so
+        discovery of everything else continues. Any other ClientError is
+        re-raised as a fatal AWSDiscoveryError.
+        """
         try:
             yield
         except ClientError as exc:
-            if exc.response["Error"]["Code"] not in (
-                    "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
-                    "AuthorizationError", "AuthorizationErrorException", "Forbidden", "ForbiddenException"):
-                raise AWSDiscoveryError(f"Incomplete AWS discovery: {exc}") from exc
-            self.access_denied.append((account, region, service))
-            log.warning(
-                f"AWS access denied (account '{account}', region '{region}', service '{service}', "
-                f"resource '{resource}'): {exc}. "
-                "Skipping inaccessible discovery; existing source objects will be retained.")
+            code = exc.response.get("Error", {}).get("Code", "")
+            op = operation or exc.operation_name
+            if code in AUTH_ERROR_CODES:
+                where = " ".join(filter(None, [
+                    f"account '{account}'" if account else None,
+                    f"region '{region}'" if region else None,
+                    f"service '{service}'" if service else None,
+                    f"resource '{resource}'" if resource else None,
+                ]))
+                log.warning(f"AWS {code} on {op}{(' for ' + where) if where else ''}: "
+                            f"{exc.response.get('Error', {}).get('Message', '')}")
+                scope = (account, region, service)
+                if scope not in self.access_denied:
+                    self.access_denied.append(scope)
+                if resource is not None or operation is not None:
+                    self.access_checks.append(AWSAccessCheck(account, region, service, resource, op, True))
+                return
+            raise AWSDiscoveryError(f"{code or type(exc).__name__}: {exc}") from exc
+        else:
+            if resource is not None or operation is not None:
+                self.access_checks.append(
+                    AWSAccessCheck(account, region, service, resource, operation or "", False))
 
-    def discover_organization(self, regions, role_name, expected_account=None, discovery_region=None,
-                              include_management=False, external_id=None, account_ids=None, services=()):
-        """Collect selected accounts, recording authorization-denied scopes for retention."""
-        self.access_denied = []
-        self.access_checks = []
-        clients = []
-        current_account = None
-        try:
-            bootstrap = (discovery_region or self.session.region_name) if regions == ["auto"] else regions[0]
-            if not bootstrap:
-                raise AWSDiscoveryError(
-                    "Organization discovery requires discovery_region or an AWS profile/environment region "
-                    "(AWS_DEFAULT_REGION).")
-            config = Config(retries={"mode": "standard", "max_attempts": 5},
-                            connect_timeout=10, read_timeout=60)
-            sts = self.session.client("sts", region_name=bootstrap, config=config)
-            self.track_access(sts, None, None, "sts")
-            clients.append(sts)
-            identity = sts.get_caller_identity()
-            if expected_account is not None and identity["Account"] != expected_account:
-                raise AWSDiscoveryError(
-                    f"AWS account mismatch: expected {expected_account}, authenticated as {identity['Account']}.")
-            partition = identity["Arn"].split(":")[1]
-            organizations = self.session.client("organizations", region_name=bootstrap, config=config)
-            self.track_access(organizations, None, None, "organizations")
-            clients.append(organizations)
-            management_account = organizations.describe_organization()["Organization"]["MasterAccountId"]
-            accounts = set()
-            account_names = {}
-            for page in organizations.get_paginator("list_accounts").paginate():
-                for account in page["Accounts"]:
-                    account_id = account["Id"]
-                    if account["State"] != "ACTIVE":
-                        log.info(f"AWS organization: excluding account '{account_id}' in state '{account['State']}'.")
-                        continue
-                    if account_id == management_account and not include_management:
-                        continue
-                    accounts.add(account_id)
-                    account_names[account_id] = account.get("Name") or account_id
-            if account_ids:
-                missing = set(account_ids) - accounts
-                if missing:
-                    raise AWSDiscoveryError(
-                        f"Requested organization accounts are not active/eligible: {', '.join(sorted(missing))}.")
-                accounts.intersection_update(account_ids)
-            if not accounts:
-                raise AWSDiscoveryError("Organization discovery returned no eligible accounts.")
-            snapshots = {}
-            for current_account in sorted(accounts):
-                role_arn = f"arn:{partition}:iam::{current_account}:role/{role_name}"
-                log.info(f"AWS organization: discovering account '{current_account}' using '{role_arn}'.")
-                request = {"RoleArn": role_arn, "RoleSessionName": "netbox-sync", "DurationSeconds": 3600}
-                if external_id:
-                    request["ExternalId"] = external_id
-                credentials = None
-                self.track_access(sts, current_account, None, "sts")
-                with self.tolerate_access_denied(current_account, service="sts"):
-                    credentials = sts.assume_role(**request)["Credentials"]
-                if credentials is None:
-                    continue
-                member = AWSClient(session=boto3.Session(
-                    aws_access_key_id=credentials["AccessKeyId"],
-                    aws_secret_access_key=credentials["SecretAccessKey"],
-                    aws_session_token=credentials["SessionToken"], region_name=bootstrap))
-                options = {"services": services} if services else {}
-                _, snapshot = member.discover(regions, current_account, discovery_region, **options)
-                self.access_denied.extend(member.access_denied)
-                self.access_checks.extend(member.access_checks)
-                snapshots[current_account] = snapshot
-            self.account_names = account_names
-            return snapshots
-        except ClientError as exc:
-            with self.tolerate_access_denied(service="organizations"):
-                raise exc
-            return {}
-        except (BotoCoreError, KeyError, AWSDiscoveryError) as exc:
-            context = f" for account '{current_account}'" if current_account else ""
-            raise AWSDiscoveryError(f"Incomplete AWS organization discovery{context}: {exc}") from exc
-        finally:
-            for client in clients:
-                client.close()
+    def _tolerated(self, operation, account, region=None, service=None, resource=None):
+        """Call `operation` (a zero-arg callable), tolerating denial. Returns the
+        result, or None if the call was denied and tolerated."""
+        result = None
+        with self.tolerate_access_denied(account, region, service, resource, operation.__name__
+                                         if hasattr(operation, "__name__") else None):
+            result = operation()
+        return result
 
-    def discover(self, regions, expected_account=None, discovery_region=None, services=()):
-        """Collect accessible regions and record denied scopes before inventory changes."""
-        clients = []
-        self.access_denied = []
-        self.access_checks = []
-        account = expected_account
-        try:
-            config = Config(retries={"mode": "standard", "max_attempts": 5},
-                            connect_timeout=10, read_timeout=60)
-            automatic = regions == ["auto"]
-            bootstrap = (discovery_region or self.session.region_name) if automatic else regions[0]
-            if not bootstrap:
+    # -- identity / regions ---------------------------------------------------
+
+    def _bootstrap_region(self, regions, discovery_region):
+        if regions == ["auto"]:
+            region = discovery_region or self.session.region_name
+            if not region:
                 raise AWSDiscoveryError(
-                    "Automatic region discovery requires discovery_region or an AWS profile/environment region "
-                    "(AWS_DEFAULT_REGION).")
-            sts = self.session.client("sts", region_name=bootstrap, config=config)
-            self.track_access(sts, account, None, "account")
-            clients.append(sts)
-            account = sts.get_caller_identity()["Account"]
-            if expected_account is not None and account != expected_account:
-                raise AWSDiscoveryError(
-                    f"AWS account mismatch: expected {expected_account}, authenticated as {account}.")
-            if automatic:
-                discovery_client = self.session.client("ec2", region_name=bootstrap, config=config)
-                self.track_access(discovery_client, account, None, "account")
-                clients.append(discovery_client)
-                response = discovery_client.describe_regions(AllRegions=True)
-                regions = sorted({
-                    entry["RegionName"] for entry in response["Regions"]
-                    if entry["OptInStatus"] in ("opt-in-not-required", "opted-in")
-                })
-                if not regions:
-                    raise AWSDiscoveryError("Automatic region discovery returned no enabled regions.")
-                log.info(f"AWS account '{account}' enabled regions: {', '.join(regions)}")
-            snapshot = {}
-            for region in regions:
-                ec2 = self.session.client("ec2", region_name=region, config=config)
-                self.track_access(ec2, account, region, "ec2")
-                clients.append(ec2)
-                data = None
-                with self.tolerate_access_denied(account, region, "ec2"):
-                    data = self.discover_ec2(ec2)
-                if data is None:
-                    data = {"instances": [], "InstanceTypes": {}, "Vpcs": {}, "Subnets": {},
-                            "NetworkInterfaces": {}, "Volumes": {}, "EC2AccessDenied": True}
-                data["InaccessibleServices"] = []
-                for service in services:
-                    service_client = self.session.client(service, region_name=region, config=config)
-                    self.track_access(service_client, account, region, service)
-                    clients.append(service_client)
-                    try:
-                        with self.tolerate_access_denied(account, region, service):
-                            if service == "s3":
-                                data["Buckets"] = self.discover_s3(service_client, region, account)
-                            elif service == "lambda":
-                                data["Functions"] = self.discover_lambda(service_client)
-                            elif service == "eks":
-                                data["EKSClusters"] = self.discover_eks(service_client)
-                            else:
-                                raise AWSDiscoveryError(f"Unsupported AWS service '{service}'")
-                        key = {"s3": "Buckets", "lambda": "Functions", "eks": "EKSClusters"}[service]
-                        if key not in data:
-                            data["InaccessibleServices"].append(service)
-                    except (BotoCoreError, ClientError, KeyError) as exc:
-                        raise AWSDiscoveryError(
-                            f"Incomplete {service} discovery (account '{account}', region '{region}'): {exc}") from exc
-                snapshot[region] = data
-            return account, snapshot
-        except ClientError as exc:
-            with self.tolerate_access_denied(account, service="account"):
-                raise exc
+                    "AWS region auto-discovery needs a bootstrap region: set 'discovery_region', "
+                    "AWS_DEFAULT_REGION, or a region in the AWS profile/config.")
+            return region
+        return regions[0]
+
+    def _get_identity(self, bootstrap_region, account, sts=None):
+        sts = sts or self.session.client("sts", region_name=bootstrap_region)
+        identity_account = None
+        with self.tolerate_access_denied(None, None, "account"):
+            response = sts.get_caller_identity()
+            identity_account = response["Account"]
+            # arn:<partition>:iam::<account>:user/...
+            self._partition = response["Arn"].split(":")[1]
+        if identity_account is None:
+            return None
+        if account is not None and identity_account != account:
+            raise AWSDiscoveryError(
+                f"AWS credential account mismatch: expected '{account}', got '{identity_account}'")
+        return identity_account
+
+    def _enabled_regions(self, bootstrap_region, account):
+        ec2 = self.session.client("ec2", region_name=bootstrap_region)
+        enabled = set()
+        denied_scope = (account, None, "ec2")
+        with self.tolerate_access_denied(*denied_scope):
+            response = ec2.describe_regions(AllRegions=True)
+            for entry in response["Regions"]:
+                if entry.get("OptInStatus") in ("opt-in-not-required", "opted-in"):
+                    enabled.add(entry["RegionName"])
+        if not enabled:
+            if denied_scope in self.access_denied:
+                return []
+            raise AWSDiscoveryError("AWS region auto-discovery found no enabled regions")
+        return sorted(enabled)
+
+    # -- single-account discovery --------------------------------------------
+
+    def discover(self, regions, account=None, discovery_region=None, services=()):
+        # Starts a fresh access_denied/access_checks run so a prior denial does
+        # not linger forever once access is restored. Member clients created by
+        # discover_organization() share one access_denied/access_checks list
+        # across accounts and must not reset it on every member's call.
+        if not getattr(self, "_is_org_member", False):
+            self.access_denied = []
+            self.access_checks = []
+        bootstrap_region = self._bootstrap_region(regions, discovery_region)
+        identity_account = self._get_identity(bootstrap_region, account)
+        if identity_account is None:
             return account, {}
-        except (BotoCoreError, KeyError) as exc:
-            raise AWSDiscoveryError(f"Incomplete AWS discovery; synchronization aborted: {exc}") from exc
-        finally:
-            for client in clients:
-                client.close()
+        if regions == ["auto"]:
+            regions_to_scan = self._enabled_regions(bootstrap_region, identity_account)
+        else:
+            regions_to_scan = regions
+        snapshot = {}
+        for region in regions_to_scan:
+            snapshot[region] = self._discover_region(region, identity_account, services)
+        return identity_account, snapshot
 
-    def discover_ec2(self, ec2):
-        instances = [
-            instance
-            for page in ec2.get_paginator("describe_instances").paginate()
-            for reservation in page.get("Reservations", [])
-            for instance in reservation.get("Instances", [])
-            if instance["State"]["Name"] != "terminated"
-        ]
-        data = {"instances": instances}
-        for operation, result_key, key in (
-            ("describe_network_interfaces", "NetworkInterfaces", "NetworkInterfaceId"),
-            ("describe_volumes", "Volumes", "VolumeId"),
-            ("describe_subnets", "Subnets", "SubnetId"),
-            ("describe_vpcs", "Vpcs", "VpcId"),
-        ):
-            data[result_key] = {
-                item[key]: item
-                for page in ec2.get_paginator(operation).paginate()
-                for item in page.get(result_key, [])
+    def _discover_region(self, region, account, services):
+        ec2 = self.session.client("ec2", region_name=region)
+        data = {
+            "instances": [], "InstanceTypes": {}, "NetworkInterfaces": {},
+            "Volumes": {}, "Subnets": {}, "Vpcs": {},
+        }
+        ec2_ok = False
+        with self.tolerate_access_denied(account, region, "ec2"):
+            data["instances"] = self._describe_instances(ec2)
+            data["NetworkInterfaces"] = {
+                item["NetworkInterfaceId"]: item
+                for item in self._paginate(ec2.describe_network_interfaces, "NetworkInterfaces")
             }
-        instance_types = {}
-        names = sorted({item["InstanceType"] for item in instances})
-        for start in range(0, len(names), 100):
-            for page in ec2.get_paginator("describe_instance_types").paginate(InstanceTypes=names[start:start + 100]):
-                instance_types.update({item["InstanceType"]: item for item in page["InstanceTypes"]})
-        data["InstanceTypes"] = instance_types
+            data["Volumes"] = {item["VolumeId"]: item for item in self._paginate(ec2.describe_volumes, "Volumes")}
+            data["Subnets"] = {item["SubnetId"]: item for item in self._paginate(ec2.describe_subnets, "Subnets")}
+            data["Vpcs"] = {item["VpcId"]: item for item in self._paginate(ec2.describe_vpcs, "Vpcs")}
+            if data["instances"]:
+                types = {instance["InstanceType"] for instance in data["instances"]}
+                response = ec2.describe_instance_types(InstanceTypes=sorted(types))
+                data["InstanceTypes"] = {item["InstanceType"]: item for item in response["InstanceTypes"]}
+            ec2_ok = True
+        if not ec2_ok:
+            data["EC2AccessDenied"] = True
+
+        inaccessible = []
+        if "s3" in services:
+            buckets = self._tolerated_list(self.discover_s3, account, region, "s3", ec2.meta.region_name
+                                            if False else None,
+                                            args=(self.session.client("s3", region_name=region), region, account))
+            if buckets is None:
+                inaccessible.append("s3")
+                data["Buckets"] = []
+            else:
+                data["Buckets"] = buckets
+        if "lambda" in services:
+            functions = self._tolerated_list(self.discover_lambda, account, region, "lambda", None,
+                                             args=(self.session.client("lambda", region_name=region), region, account))
+            if functions is None:
+                inaccessible.append("lambda")
+                data["Functions"] = []
+            else:
+                data["Functions"] = functions
+        if "eks" in services:
+            clusters = self._tolerated_list(self.discover_eks, account, region, "eks", None,
+                                            args=(self.session.client("eks", region_name=region), region, account))
+            if clusters is None:
+                inaccessible.append("eks")
+                data["EKSClusters"] = []
+            else:
+                data["EKSClusters"] = clusters
+        if inaccessible:
+            data["InaccessibleServices"] = inaccessible
         return data
 
+    def _tolerated_list(self, func, account, region, service, _unused, args):
+        try:
+            with self.tolerate_access_denied(account, region, service):
+                return func(*args)
+        except AWSDiscoveryError:
+            raise
+
+    def _describe_instances(self, ec2):
+        instances = []
+        for item in self._paginate_reservations(ec2):
+            if item.get("State", {}).get("Name") != "terminated":
+                instances.append(item)
+        return instances
+
+    def _paginate_reservations(self, ec2):
+        token = None
+        while True:
+            kwargs = {"NextToken": token} if token else {}
+            response = ec2.describe_instances(**kwargs)
+            for reservation in response.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    yield instance
+            token = response.get("NextToken")
+            if not token:
+                break
+
+    def _paginate(self, func, key):
+        token = None
+        while True:
+            kwargs = {"NextToken": token} if token else {}
+            response = func(**kwargs)
+            for item in response.get(key, []):
+                yield item
+            token = response.get("NextToken")
+            if not token:
+                break
+
+    # -- S3 -------------------------------------------------------------------
+
     def discover_s3(self, client, region, account):
-        buckets = []
-        for page in client.get_paginator("list_buckets").paginate(BucketRegion=region):
-            for bucket in page["Buckets"]:
-                with self.tolerate_access_denied(account, region, "s3", bucket["Name"]):
-                    buckets.append(self.discover_s3_bucket(client, bucket, region, account))
-        return buckets
+        results = []
+        token = None
+        while True:
+            params = {"BucketRegion": region}
+            if token:
+                params["ContinuationToken"] = token
+            response = client.list_buckets(**params)
+            for bucket in response.get("Buckets", []):
+                result = self._discover_one_bucket(client, bucket, region, account)
+                if result is not None:
+                    results.append(result)
+            token = response.get("ContinuationToken")
+            if not token:
+                break
+        return results
 
-    def discover_s3_bucket(self, client, bucket, region, account):
-        name = bucket["Name"]
-        bucket_region = bucket.get("BucketRegion")
-        if bucket_region is None:
-            location = client.get_bucket_location(Bucket=name, ExpectedBucketOwner=account)
-            bucket_region = location["LocationConstraint"] or "us-east-1"
-            if bucket_region == "EU":
-                bucket_region = "eu-west-1"
-        if bucket_region != region:
-            raise AWSDiscoveryError(
-                f"S3 bucket '{name}' returned for region '{region}' belongs to '{bucket_region}'")
-        request = {"Bucket": name, "ExpectedBucketOwner": account}
-        try:
-            tags = client.get_bucket_tagging(**request)["TagSet"]
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] != "NoSuchTagSet":
-                raise
+    def _discover_one_bucket(self, client, bucket, region, account):
+            name = bucket["Name"]
+            bucket_region = bucket.get("BucketRegion")
+            if bucket_region is None:
+                location = client.get_bucket_location(Bucket=name, ExpectedBucketOwner=account)
+                bucket_region = location.get("LocationConstraint") or "us-east-1"
+            if bucket_region != region:
+                raise AWSDiscoveryError(
+                    f"AWS S3 bucket '{name}' belongs to '{bucket_region}', not the requested region '{region}'")
+
+            denied_on = None
+            params = {"Bucket": name, "ExpectedBucketOwner": account}
             tags = []
-        versioning = client.get_bucket_versioning(**request).get("Status", "Unversioned")
-        try:
-            encryption = client.get_bucket_encryption(**request)["ServerSideEncryptionConfiguration"]
-        except ClientError as exc:
-            if exc.response["Error"]["Code"] != "ServerSideEncryptionConfigurationNotFoundError":
-                raise
+            try:
+                response = client.get_bucket_tagging(**params)
+                tags = response.get("TagSet", [])
+                self.access_checks.append(AWSAccessCheck(account, region, "s3", name, "GetBucketTagging", False))
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code == "NoSuchTagSet":
+                    tags = []
+                elif code in AUTH_ERROR_CODES:
+                    denied_on = "GetBucketTagging"
+                else:
+                    raise AWSDiscoveryError(f"{code}: {exc}") from exc
+
+            versioning = "Unversioned"
+            if denied_on is None:
+                try:
+                    response = client.get_bucket_versioning(**params)
+                    versioning = response.get("Status", "Unversioned")
+                except ClientError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    if code in AUTH_ERROR_CODES:
+                        denied_on = "GetBucketVersioning"
+                    else:
+                        raise AWSDiscoveryError(f"{code}: {exc}") from exc
+
             encryption = {}
-        return {
-            "Name": name, "Region": region, "Tags": tags, "Versioning": versioning,
-            "Encryption": encryption, "Arn": f"arn:{client.meta.partition}:s3:::{name}",
-        }
+            if denied_on is None:
+                try:
+                    response = client.get_bucket_encryption(**params)
+                    encryption = response.get("ServerSideEncryptionConfiguration", {})
+                except ClientError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    if code == "ServerSideEncryptionConfigurationNotFoundError":
+                        encryption = {}
+                    elif code in AUTH_ERROR_CODES:
+                        denied_on = "GetBucketEncryption"
+                    else:
+                        raise AWSDiscoveryError(f"{code}: {exc}") from exc
 
-    def discover_lambda(self, client):
-        functions = []
-        for page in client.get_paginator("list_functions").paginate():
-            for reference in page["Functions"]:
-                config = client.get_function_configuration(FunctionName=reference["FunctionArn"])
-                # Do not retain environment variables or other unneeded configuration.
-                function = {key: config[key] for key in (
-                    "FunctionArn", "FunctionName", "MemorySize", "State", "Runtime", "Handler",
-                    "Timeout", "LastModified", "Architectures", "PackageType", "VpcConfig",
-                ) if key in config}
-                if function["FunctionArn"] != reference["FunctionArn"]:
-                    raise AWSDiscoveryError(f"Lambda function identity changed for '{reference['FunctionArn']}'")
-                function["Tags"] = client.list_tags(Resource=function["FunctionArn"]).get("Tags", {})
-                functions.append(function)
-        return functions
+            if denied_on is not None:
+                log.warning(f"AWS AccessDenied on {denied_on} for account '{account}', "
+                            f"region '{region}', bucket '{name}'")
+                scope = (account, region, "s3")
+                if scope not in self.access_denied:
+                    self.access_denied.append(scope)
+                self.access_checks.append(AWSAccessCheck(account, region, "s3", name, denied_on, True))
+                return None
 
-    def discover_eks(self, client):
+            return {
+                "Name": name, "Region": region, "Arn": f"arn:aws:s3:::{name}",
+                "Tags": tags, "Versioning": versioning, "Encryption": encryption,
+            }
+
+    # -- Lambda -----------------------------------------------------------------
+
+    def discover_lambda(self, client, region, account):
+        results = []
+        token = None
+        while True:
+            kwargs = {"Marker": token} if token else {}
+            response = client.list_functions(**kwargs)
+            for entry in response.get("Functions", []):
+                arn = entry["FunctionArn"]
+                config = client.get_function_configuration(FunctionName=arn)
+                config.pop("Environment", None)
+                config.pop("ResponseMetadata", None)
+                tags = client.list_tags(Resource=arn).get("Tags", {})
+                results.append({**config, "FunctionArn": arn, "Tags": tags})
+            token = response.get("NextMarker")
+            if not token:
+                break
+        return results
+
+    # -- EKS ----------------------------------------------------------------
+
+    def discover_eks(self, client, region, account):
         clusters = []
-        for page in client.get_paginator("list_clusters").paginate():
-            for name in page["clusters"]:
-                cluster = client.describe_cluster(name=name)["cluster"]
-                if cluster["name"] != name:
-                    raise AWSDiscoveryError(f"EKS cluster identity changed for '{name}'")
-                groups = []
-                for group_page in client.get_paginator("list_nodegroups").paginate(clusterName=name):
-                    for group_name in group_page["nodegroups"]:
-                        group = client.describe_nodegroup(clusterName=name, nodegroupName=group_name)["nodegroup"]
-                        if group["clusterName"] != name or group["nodegroupName"] != group_name:
-                            raise AWSDiscoveryError(f"EKS node group identity changed for '{group_name}'")
-                        groups.append({key: group[key] for key in (
-                            "nodegroupName", "nodegroupArn", "status", "version", "capacityType",
-                            "instanceTypes", "scalingConfig", "subnets", "resources",
-                        ) if key in group})
-                profiles = []
-                for profile_page in client.get_paginator("list_fargate_profiles").paginate(clusterName=name):
-                    for profile_name in profile_page["fargateProfileNames"]:
-                        profile = client.describe_fargate_profile(
-                            clusterName=name, fargateProfileName=profile_name)["fargateProfile"]
-                        if profile["clusterName"] != name or profile["fargateProfileName"] != profile_name:
-                            raise AWSDiscoveryError(f"EKS Fargate profile identity changed for '{profile_name}'")
-                        profiles.append({key: profile[key] for key in (
-                            "fargateProfileName", "fargateProfileArn", "status", "subnets", "selectors",
-                        ) if key in profile})
-                clusters.append({
-                    **{key: cluster[key] for key in (
-                        "name", "arn", "status", "version", "endpoint", "resourcesVpcConfig", "tags",
-                    ) if key in cluster},
-                    "nodegroups": sorted(groups, key=lambda group: group["nodegroupName"]),
-                    "fargateProfiles": sorted(profiles, key=lambda profile: profile["fargateProfileName"]),
-                })
+        token = None
+        while True:
+            kwargs = {"nextToken": token} if token else {}
+            response = client.list_clusters(**kwargs)
+            for name in response.get("clusters", []):
+                clusters.append(self._discover_one_eks_cluster(client, name))
+            token = response.get("nextToken")
+            if not token:
+                break
         return clusters
+
+    def _discover_one_eks_cluster(self, client, name):
+        cluster = client.describe_cluster(name=name)["cluster"]
+
+        cluster["nodegroups"] = []
+        token = None
+        while True:
+            kwargs = {"nextToken": token} if token else {}
+            response = client.list_nodegroups(clusterName=name, **kwargs)
+            for group_name in response.get("nodegroups", []):
+                nodegroup = client.describe_nodegroup(clusterName=name, nodegroupName=group_name)["nodegroup"]
+                cluster["nodegroups"].append(nodegroup)
+            token = response.get("nextToken")
+            if not token:
+                break
+
+        cluster["fargateProfiles"] = []
+        token = None
+        while True:
+            kwargs = {"nextToken": token} if token else {}
+            response = client.list_fargate_profiles(clusterName=name, **kwargs)
+            for profile_name in response.get("fargateProfileNames", []):
+                profile = client.describe_fargate_profile(
+                    clusterName=name, fargateProfileName=profile_name)["fargateProfile"]
+                cluster["fargateProfiles"].append(profile)
+            token = response.get("nextToken")
+            if not token:
+                break
+
+        return cluster
+
+    def _paginate_token(self, func, key, token_key):
+        token = None
+        while True:
+            kwargs = {token_key: token} if token else {}
+            response = func(**kwargs)
+            for item in response.get(key, []):
+                yield item
+            token = response.get(token_key)
+            if not token:
+                break
+
+    # -- organization ---------------------------------------------------------
+
+    def discover_organization(self, regions, role_name, expected_account=None, discovery_region=None,
+                               include_management=False, external_id=None, account_ids=None, services=()):
+        self.access_denied = []
+        self.access_checks = []
+        bootstrap_region = self._bootstrap_region(regions, discovery_region)
+        sts = self.session.client("sts", region_name=bootstrap_region)
+        management_account = self._get_identity(bootstrap_region, expected_account, sts=sts)
+        if management_account is None:
+            return {}
+
+        organizations = self.session.client("organizations", region_name=bootstrap_region)
+        org_info = None
+        with self.tolerate_access_denied(management_account, None, "organizations"):
+            org_info = organizations.describe_organization()["Organization"]
+        if org_info is None:
+            return {}
+        master_account = org_info["MasterAccountId"]
+
+        accounts = None
+        with self.tolerate_access_denied(management_account, None, "organizations"):
+            accounts = list(self._paginate(organizations.list_accounts, "Accounts"))
+        if accounts is None:
+            return {}
+
+        active = {entry["Id"]: entry for entry in accounts if entry.get("State") == "ACTIVE"}
+        self.account_names.update({account_id: entry.get("Name", account_id)
+                                   for account_id, entry in active.items()})
+
+        if account_ids:
+            missing = [account_id for account_id in account_ids if account_id not in active]
+            if missing or (not include_management and any(a == master_account for a in account_ids)):
+                bad = [a for a in account_ids if a not in active or (a == master_account and not include_management)]
+                raise AWSDiscoveryError(
+                    f"AWS organization account(s) {', '.join(bad)} are not active/eligible for discovery")
+            selection = list(account_ids)
+        else:
+            selection = [account_id for account_id in active
+                        if account_id != master_account or include_management]
+        if not selection:
+            raise AWSDiscoveryError("AWS organization discovery found no eligible accounts")
+
+        snapshots = {}
+        for account_id in selection:
+            member_client = self._assume_member(sts, account_id, role_name, external_id, management_account)
+            if member_client is None:
+                continue
+            options = {"services": services} if services else {}
+            discovered_account, snapshot = member_client.discover(
+                regions, account_id, discovery_region, **options)
+            if discovered_account != account_id:
+                continue
+            snapshots[account_id] = snapshot
+        return snapshots
+
+    def _assume_member(self, sts, account_id, role_name, external_id, management_account):
+        role_arn = self._role_arn(account_id, role_name)
+        kwargs = {"RoleArn": role_arn, "RoleSessionName": "netbox-sync", "DurationSeconds": 3600}
+        if external_id:
+            kwargs["ExternalId"] = external_id
+        credentials = None
+        with self.tolerate_access_denied(account_id, None, "sts", operation="AssumeRole"):
+            response = sts.assume_role(**kwargs)
+            credentials = response["Credentials"]
+        if credentials is None:
+            return None
+        member = AWSClient.__new__(AWSClient)
+        member.session = boto3.Session(
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+        )
+        member.access_denied = self.access_denied
+        member.access_checks = self.access_checks
+        member.account_names = self.account_names
+        member._tracked_scopes = {}
+        member._is_org_member = True
+        return member
+
+    def _role_arn(self, account_id, role_name):
+        partition = getattr(self, "_partition", "aws")
+        return f"arn:{partition}:iam::{account_id}:role/{role_name}"
