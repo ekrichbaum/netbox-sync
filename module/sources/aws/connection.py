@@ -1,3 +1,12 @@
+# -*- coding: utf-8 -*-
+#  Copyright (c) 2020 - 2026 netbox-sync team. All rights reserved.
+#
+#  netbox-sync.py
+#
+#  This work is licensed under the terms of the MIT license.
+#  For a copy, see file LICENSE.txt included in this
+#  repository or visit: <https://opensource.org/licenses/MIT>.
+
 from hashlib import sha256
 from ipaddress import ip_address, ip_interface, ip_network
 from itertools import product
@@ -164,6 +173,33 @@ class AWSHandler(SourceBase):
                                 f"AWS instance '{instance['InstanceId']}' references undiscovered EKS cluster "
                                 f"'{name}' (account '{account}', region '{region}'); retaining EC2 placement.")
 
+    def validate_arn(self, arn, service, account, region):
+        parts = arn.split(":", 5)
+        if len(parts) != 6 or parts[0] != "arn" or parts[2:5] != [service, region, account] or not parts[5]:
+            raise ValueError(f"Invalid {service} resource ARN '{arn}' for account '{account}', region '{region}'")
+
+    def service_tags(self, tags):
+        result = [f"AWS:{key}={tags[key]}" for key in self.settings.tag_keys if key in tags]
+        if any(len(tag) > 100 for tag in result):
+            raise ValueError("AWS service tag exceeds the NetBox tag name limit (100 characters)")
+        return result
+
+    def reconcile_tags(self, item, tags):
+        # Tag lookup can reuse an existing name with different capitalization.
+        desired_tags = {self.inventory.get_by_data(NBTag, data={"name": name}) for name in tags}
+        managed_prefixes = tuple(f"AWS:{key}=".casefold() for key in self.settings.tag_keys)
+        for tag in item.data.get("tags", []):
+            if tag.get_display_name().casefold().startswith(managed_prefixes) and tag not in desired_tags:
+                item.remove_tags(tag)
+
+    def retain_disabled_services(self):
+        for object_type in (NBVM, NBVirtualDisk, NBCluster):
+            for item in self.inventory.get_all_items(object_type):
+                service = (item.data.get("custom_fields") or {}).get("aws_service")
+                if service in ("s3", "lambda", "eks") and not getattr(self.settings, f"sync_{service}") and \
+                        (item.source is self or self.source_tag in item.get_tags()):
+                    item.set_source(self)
+
     def access_scope(self, item):
         fields = item.data.get("custom_fields") or {}
         metadata = fields.get("aws_metadata") or {}
@@ -245,33 +281,6 @@ class AWSHandler(SourceBase):
                     if tag.startswith(prefix) and tag[len(prefix):] in succeeded - denied:
                         item.remove_tags(tag)
 
-    def validate_arn(self, arn, service, account, region):
-        parts = arn.split(":", 5)
-        if len(parts) != 6 or parts[0] != "arn" or parts[2:5] != [service, region, account] or not parts[5]:
-            raise ValueError(f"Invalid {service} resource ARN '{arn}' for account '{account}', region '{region}'")
-
-    def service_tags(self, tags):
-        result = [f"AWS:{key}={tags[key]}" for key in self.settings.tag_keys if key in tags]
-        if any(len(tag) > 100 for tag in result):
-            raise ValueError("AWS service tag exceeds the NetBox tag name limit (100 characters)")
-        return result
-
-    def reconcile_tags(self, item, tags):
-        # Tag lookup can reuse an existing name with different capitalization.
-        desired_tags = {self.inventory.get_by_data(NBTag, data={"name": name}) for name in tags}
-        managed_prefixes = tuple(f"AWS:{key}=".casefold() for key in self.settings.tag_keys)
-        for tag in item.data.get("tags", []):
-            if tag.get_display_name().casefold().startswith(managed_prefixes) and tag not in desired_tags:
-                item.remove_tags(tag)
-
-    def retain_disabled_services(self):
-        for object_type in (NBVM, NBVirtualDisk, NBCluster):
-            for item in self.inventory.get_all_items(object_type):
-                service = (item.data.get("custom_fields") or {}).get("aws_service")
-                if service in ("s3", "lambda", "eks") and not getattr(self.settings, f"sync_{service}") and \
-                        (item.source is self or self.source_tag in item.get_tags()):
-                    item.set_source(self)
-
     def retain_source_objects(self):
         # Source-wide retention also protects children and cross-account shared-network dependencies.
         for object_type in self.dependent_netbox_objects:
@@ -317,27 +326,18 @@ class AWSHandler(SourceBase):
     def service_object(self, object_type, identity, data):
         matches = [item for item in self.inventory.get_all_items(object_type)
                    if (item.data.get("custom_fields") or {}).get("aws_resource_id") == identity]
-        error = None
         if len(matches) > 1:
-            error = f"Multiple NetBox {object_type.name} objects match AWS resource '{identity}'"
-        elif matches:
+            raise ValueError(f"Multiple NetBox {object_type.name} objects match AWS resource '{identity}'")
+        if matches:
             item = matches[0]
             if item.source is not self and self.source_tag not in item.get_tags():
-                error = f"AWS resource '{identity}' belongs to another source"
+                raise ValueError(f"AWS resource '{identity}' belongs to another source")
+            item.update(data=data, source=self)
         else:
             parent = "virtual_machine" if object_type is NBVirtualDisk else "cluster" if object_type is NBVM else "group"
             if any(item.data.get("name") == data["name"] and item.data.get(parent) is data.get(parent)
                    for item in self.inventory.get_all_items(object_type)):
-                error = f"NetBox {object_type.name} name collision for AWS resource '{identity}'"
-        if error is not None:
-            log.error(
-                f"AWS source '{self.name}': {error}. Skipping this resource and any dependent resources. "
-                "Retaining all previously managed source objects this run to prevent pruning skipped resources.")
-            self.retain_source_objects()
-            return None
-        if matches:
-            item.update(data=data, source=self)
-        else:
+                raise ValueError(f"NetBox {object_type.name} name collision for AWS resource '{identity}'")
             item = self.inventory.add_object(object_type, data=data, source=self)
         self.reconcile_tags(item, data["tags"])
         return item
@@ -386,28 +386,39 @@ class AWSHandler(SourceBase):
         if not buckets:
             return
         identity = f"s3/{account}/{region}"
-        cluster = self.service_cluster(
-            account, region, site, group, "s3", identity, f"S3 {account}/{region}")
-        if cluster is None:
+        try:
+            cluster = self.service_cluster(
+                account, region, site, group, "s3", identity, f"S3 {account}/{region}")
+        except ValueError as exc:
+            self.retain_source_objects()
+            log.warning(f"Skipping S3 buckets (account '{account}', region '{region}'): {exc}")
             return
-        holder = self.logical_vm(
-            account, region, site, cluster, "s3", identity, f"S3 inventory {account}/{region}",
-            {"kind": "bucket-inventory-holder", "usage_status": "unknown"}, {})
-        if holder is None:
+        try:
+            holder = self.logical_vm(
+                account, region, site, cluster, "s3", identity, f"S3 inventory {account}/{region}",
+                {"kind": "bucket-inventory-holder", "usage_status": "unknown"}, {})
+        except ValueError as exc:
+            self.retain_source_objects()
+            log.warning(f"Skipping S3 buckets (account '{account}', region '{region}'): {exc}")
             return
         for bucket in buckets:
             bucket_id = f"s3/{account}/{bucket['Name']}"
-            self.service_object(NBVirtualDisk, bucket_id, {
-                "name": bucket["Name"], "virtual_machine": holder,
-                # NetBox requires size; zero is explicitly unknown, never a usage measurement.
-                "size": 0, "description": "AWS S3 bucket; usage unknown (size 0 is a placeholder, not measured).",
-                "custom_fields": {
-                    "aws_service": "s3", "aws_resource_id": bucket_id,
-                    "aws_metadata": {**{key: value for key, value in bucket.items() if key != "Tags"},
-                                     "usage_status": "unknown", "usage_bytes": None},
-                },
-                "tags": self.service_tags({tag["Key"]: tag["Value"] for tag in bucket["Tags"]}),
-            })
+            try:
+                self.service_object(NBVirtualDisk, bucket_id, {
+                    "name": bucket["Name"], "virtual_machine": holder,
+                    # NetBox requires size; zero is explicitly unknown, never a usage measurement.
+                    "size": 0,
+                    "description": "AWS S3 bucket; usage unknown (size 0 is a placeholder, not measured).",
+                    "custom_fields": {
+                        "aws_service": "s3", "aws_resource_id": bucket_id,
+                        "aws_metadata": {**{key: value for key, value in bucket.items() if key != "Tags"},
+                                         "usage_status": "unknown", "usage_bytes": None},
+                    },
+                    "tags": self.service_tags({tag["Key"]: tag["Value"] for tag in bucket["Tags"]}),
+                })
+            except ValueError as exc:
+                log.warning(f"Skipping S3 bucket '{bucket['Name']}' "
+                            f"(account '{account}', region '{region}'): {exc}")
 
     def resolve_shared_networks(self, snapshots):
         networks = {}
@@ -622,19 +633,33 @@ class AWSHandler(SourceBase):
             inaccessible = data.get("InaccessibleServices", [])
             if self.settings.sync_eks and "eks" not in inaccessible:
                 for resource in data["EKSClusters"]:
-                    eks_cluster = self.service_cluster(
-                        account, region, site, group, "eks", resource["arn"],
-                        f"EKS {account}/{region}/{resource['name']}",
-                        metadata={key: value for key, value in resource.items() if key != "tags"},
-                        tags=resource.get("tags", {}))
-                    eks_clusters[resource["name"]] = eks_cluster
+                    try:
+                        eks_cluster = self.service_cluster(
+                            account, region, site, group, "eks", resource["arn"],
+                            f"EKS {account}/{region}/{resource['name']}",
+                            metadata={key: value for key, value in resource.items() if key != "tags"},
+                            tags=resource.get("tags", {}))
+                        eks_clusters[resource["name"]] = eks_cluster
+                    except ValueError as exc:
+                        self.retain_source_objects()
+                        log.warning(f"Skipping EKS cluster '{resource['name']}' "
+                                    f"(account '{account}', region '{region}'): {exc}")
             if self.settings.sync_lambda and "lambda" not in inaccessible:
-                lambda_cluster = self.service_cluster(
-                    account, region, site, group, "lambda", f"lambda/{account}/{region}",
-                    f"Lambda {account}/{region}")
-                if lambda_cluster is not None:
+                try:
+                    lambda_cluster = self.service_cluster(
+                        account, region, site, group, "lambda", f"lambda/{account}/{region}",
+                        f"Lambda {account}/{region}")
+                except ValueError as exc:
+                    self.retain_source_objects()
+                    log.warning(f"Skipping Lambda functions (account '{account}', region '{region}'): {exc}")
+                else:
                     for function in data["Functions"]:
-                        self.sync_lambda(account, region, site, lambda_cluster, function)
+                        try:
+                            self.sync_lambda(account, region, site, lambda_cluster, function)
+                        except ValueError as exc:
+                            self.retain_source_objects()
+                            log.warning(f"Skipping function '{function['FunctionName']}' "
+                                        f"(account '{account}', region '{region}'): {exc}")
             if self.settings.sync_s3 and "s3" not in inaccessible:
                 self.sync_s3(account, region, site, group, data["Buckets"])
             name_counts = {}
@@ -644,20 +669,19 @@ class AWSHandler(SourceBase):
                 key = name.casefold()
                 name_counts[key] = name_counts.get(key, 0) + 1
             for instance in data["instances"]:
-                instance_cluster = eks_clusters.get(
-                    data.get("EKSWorkers", {}).get(instance["InstanceId"]), cluster)
-                if instance_cluster is None:
-                    log.error(
-                        f"AWS source '{self.name}': Skipping instance '{instance['InstanceId']}' "
-                        f"(account '{account}', region '{region}') because its EKS cluster was skipped.")
-                    continue
                 tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
                 vm_name = tags.get("Name", "").strip() or instance["InstanceId"]
                 if name_counts[vm_name.casefold()] > 1:
                     vm_name = f"{vm_name} ({instance['InstanceId']})"
+                eks_cluster_name = data.get("EKSWorkers", {}).get(instance["InstanceId"])
+                if eks_cluster_name is not None and eks_cluster_name not in eks_clusters and \
+                        self.settings.sync_eks and "eks" not in inaccessible:
+                    log.warning(f"Skipping instance '{instance['InstanceId']}' (account '{account}', "
+                                f"region '{region}'): its EKS cluster '{eks_cluster_name}' was not synced.")
+                    continue
                 self.sync_instance(
                     account, region, instance, data, site,
-                    instance_cluster,
+                    eks_clusters.get(eks_cluster_name, cluster),
                     api_version, vm_name=vm_name)
 
     def sync_instance(self, account, region, instance, data, site, cluster, api_version, vm_name=None):
