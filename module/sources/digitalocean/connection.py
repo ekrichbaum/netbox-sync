@@ -17,6 +17,7 @@ from module.netbox import (
     NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk, NetBoxObject,
 )
 from module.netbox.inventory import NetBoxInventory
+from module.netbox.connection import NetBoxHandler
 from module.sources.common.source_base import SourceBase
 from module.sources.digitalocean.client import DigitalOceanClient
 from module.sources.digitalocean.config import DigitalOceanConfig
@@ -250,9 +251,29 @@ class DigitalOceanHandler(SourceBase):
               vm.data["cluster"].data.get("group") is group))
         ]
         if len(candidates) > 1:
-            message = f"Multiple DigitalOcean VMs match resource ID '{identity}' for source '{self.name}'."
-            log.error(message)
-            raise ValueError(message)
+            current = [vm for vm in candidates if NetBoxHandler.orphaned_tag not in vm.get_tags()]
+            if len(current) == 1:
+                for orphan in candidates:
+                    if orphan is current[0]:
+                        continue
+                    log.warning(
+                        f"Ignoring orphaned DigitalOcean VM '{orphan.get_display_name()}' "
+                        f"(NetBox ID {orphan.nb_id}) with resource ID '{identity}' for source '{self.name}'; "
+                        f"using '{current[0].get_display_name()}' (NetBox ID {current[0].nb_id}). "
+                        "The orphaned VM is left for normal orphan pruning."
+                    )
+                candidates = current
+            else:
+                details = "; ".join(
+                    f"'{vm.get_display_name()}' (NetBox ID {vm.nb_id}, "
+                    f"cluster '{vm.data['cluster'].get_display_name() if vm.data.get('cluster') else None}', "
+                    f"orphaned={NetBoxHandler.orphaned_tag in vm.get_tags()})"
+                    for vm in candidates
+                )
+                do_error_exit(
+                    f"Multiple DigitalOcean VMs match resource ID '{identity}' for source '{self.name}': "
+                    f"{details}. Resolve the duplicate records in NetBox before retrying."
+                )
         vm = candidates[0] if candidates else self.inventory.get_by_data(NBVM, data=data)
         if not candidates and vm is not None:
             existing_id = (vm.data.get("custom_fields") or {}).get("digitalocean_resource_id")
