@@ -5,10 +5,13 @@
 #  For a copy, see file LICENSE.txt included in this
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
+from collections import Counter
 from ipaddress import ip_interface
 from packaging import version
+import requests
 
 from module.common.logging import get_logger
+from module.common.misc import do_error_exit
 from module.netbox import (
     NBCustomField, NBCluster, NBClusterGroup, NBClusterType, NBIPAddress, NBPlatform,
     NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk, NetBoxObject,
@@ -39,6 +42,8 @@ class DigitalOceanHandler(SourceBase):
         self.name = name
         self.log = get_logger()
         self._ip_claims = {}
+        self._regions_by_slug = {}
+        self._vm_name_counts = Counter()
         self.set_source_tag()
 
         settings_handler = DigitalOceanConfig()
@@ -58,12 +63,16 @@ class DigitalOceanHandler(SourceBase):
         # Fetch everything before touching inventory so API failures cannot produce
         # a partial run that later looks like missing resources.
         try:
+            regions = client.get_collection("regions", "regions")
             droplets = client.get_collection("droplets", "droplets")
             volumes = client.get_collection("volumes", "volumes") if self.settings.sync_volumes else []
             databases = client.get_collection("databases", "databases") if self.settings.sync_databases else []
+        except (requests.RequestException, ValueError) as exc:
+            do_error_exit(f"DigitalOcean discovery failed for source '{self.name}': {exc}")
         finally:
             client.close()
 
+        self._regions_by_slug = {region["slug"]: region for region in regions}
         self.log.info(
             f"Connected to DigitalOcean, found {len(droplets)} droplets, "
             f"{len(volumes)} volumes and {len(databases)} database clusters"
@@ -84,24 +93,30 @@ class DigitalOceanHandler(SourceBase):
         )
         volumes_by_id = {str(volume["id"]): volume for volume in volumes}
         clusters = {}
+        resources = []
 
-        for droplet in droplets:
-            cluster = self._get_cluster(droplet.get("region"), cluster_group, cluster_type, clusters)
-            if cluster is None:
-                log.warning(f"Droplet '{droplet.get('name')}' has no region; skipping.")
-                continue
-            vm = self._sync_droplet(droplet, cluster)
-            self._sync_droplet_network(vm, droplet)
-            self._sync_droplet_disks(vm, droplet, volumes_by_id)
-
-        for database in databases:
-            cluster = self._get_cluster(database.get("region"), cluster_group, cluster_type, clusters)
-            if cluster is None:
-                log.warning(f"Database cluster '{database.get('name')}' has no region; skipping.")
-                continue
-            self._sync_database(database, cluster)
+        for resource_type, collection in (("droplet", droplets), ("database", databases)):
+            for resource in collection:
+                cluster = self._get_cluster(resource.get("region"), cluster_group, cluster_type, clusters)
+                if cluster is None:
+                    log.warning(f"DigitalOcean {resource_type} '{resource.get('name')}' has no region; skipping.")
+                    continue
+                resources.append((resource_type, resource, cluster))
+        self._vm_name_counts = Counter(
+            (cluster, self._resource_name(resource, resource_type)[:64].casefold())
+            for resource_type, resource, cluster in resources
+        )
+        for resource_type, resource, cluster in resources:
+            if resource_type == "droplet":
+                vm = self._sync_droplet(resource, cluster)
+                self._sync_droplet_network(vm, resource)
+                self._sync_droplet_disks(vm, resource, volumes_by_id)
+            else:
+                self._sync_database(resource, cluster)
 
     def _get_cluster(self, region, cluster_group, cluster_type, clusters):
+        region_slug = region.get("slug") if isinstance(region, dict) else region
+        region = self._regions_by_slug.get(region_slug, region)
         if isinstance(region, dict):
             region_slug = region.get("slug") or region.get("name")
             region_name = region.get("name") or region_slug
@@ -138,6 +153,8 @@ class DigitalOceanHandler(SourceBase):
                 netbox_region = self.inventory.add_object(
                     NBRegion, data={"name": target_name, "slug": target_slug}, source=self,
                 )
+            elif self.source_tag in netbox_region.get_tags():
+                netbox_region.set_source(self)
             cluster_data["scope_type"] = NBRegion.object_type
             cluster_data["scope_id"] = netbox_region
 
@@ -175,15 +192,16 @@ class DigitalOceanHandler(SourceBase):
         if disk_gb is None:
             disk_gb = size.get("disk")
         vm_data = {
-            "name": name[:64],
+            "name": self._vm_name(droplet, cluster, "droplet"),
             "cluster": cluster,
             "status": "active" if droplet.get("status") == "active" else "offline",
-            "serial": str(droplet.get("id")) if droplet.get("id") is not None else None,
             "vcpus": vcpus,
             "memory": memory,
         }
+        if version.parse(self.inventory.netbox_api_version) >= version.parse("4.1.0"):
+            vm_data["serial"] = str(droplet.get("id")) if droplet.get("id") is not None else None
         if disk_gb is not None and version.parse(self.inventory.netbox_api_version) < version.parse("3.7.0"):
-            vm_data["disk"] = int(disk_gb) * 1024
+            vm_data["disk"] = int(disk_gb)
 
         platform = self._droplet_platform(droplet.get("image"))
         if platform:
@@ -205,7 +223,45 @@ class DigitalOceanHandler(SourceBase):
         if custom_fields:
             vm_data["custom_fields"] = custom_fields
 
-        return self.inventory.add_update_object(NBVM, data=vm_data, source=self)
+        return self._sync_vm(vm_data)
+
+    @staticmethod
+    def _resource_name(resource, resource_type):
+        name = str(resource.get("name", "")).strip()
+        return f"db-{name}" if resource_type == "database" else name
+
+    def _vm_name(self, resource, cluster, resource_type):
+        name = self._resource_name(resource, resource_type)
+        if self._vm_name_counts[(cluster, name[:64].casefold())] > 1:
+            suffix = f" ({resource['id']})"
+            return name[:64 - len(suffix)] + suffix
+        return name[:64]
+
+    def _sync_vm(self, data):
+        identity = (data.get("custom_fields") or {}).get("digitalocean_resource_id")
+        cluster = data["cluster"]
+        group = cluster.data.get("group")
+        candidates = [
+            vm for vm in self.inventory.get_all_items(NBVM)
+            if identity is not None and
+            (vm.data.get("custom_fields") or {}).get("digitalocean_resource_id") == identity and
+            (vm.source is self or self.source_tag in vm.get_tags() or vm.data.get("cluster") is cluster or
+             (group is not None and vm.data.get("cluster") is not None and
+              vm.data["cluster"].data.get("group") is group))
+        ]
+        if len(candidates) > 1:
+            message = f"Multiple DigitalOcean VMs match resource ID '{identity}' for source '{self.name}'."
+            log.error(message)
+            raise ValueError(message)
+        vm = candidates[0] if candidates else self.inventory.get_by_data(NBVM, data=data)
+        if not candidates and vm is not None:
+            existing_id = (vm.data.get("custom_fields") or {}).get("digitalocean_resource_id")
+            if existing_id is not None and existing_id != identity:
+                vm = None
+        if vm is None:
+            return self.inventory.add_object(NBVM, data=data, source=self)
+        vm.update(data=data, source=self)
+        return vm
 
     @staticmethod
     def _droplet_platform(image):
@@ -320,27 +376,28 @@ class DigitalOceanHandler(SourceBase):
         disk_gb = droplet.get("disk")
         if disk_gb is None:
             disk_gb = (droplet.get("size") or {}).get("disk")
-        total_disk_mb = int(disk_gb or 0) * 1024
+        disk_factor = 1024 if version.parse(self.inventory.netbox_api_version) >= version.parse("4.1.0") else 1
+        total_disk = int(disk_gb or 0) * disk_factor
         attached_volumes = [
             volumes_by_id[str(volume_id)]
             for volume_id in (droplet.get("volume_ids") or [])
             if str(volume_id) in volumes_by_id
         ]
-        total_disk_mb += sum(int(volume.get("size_gigabytes", 0)) * 1024 for volume in attached_volumes)
+        total_disk += sum(int(volume.get("size_gigabytes", 0)) * disk_factor for volume in attached_volumes)
 
         if version.parse(self.inventory.netbox_api_version) < version.parse("3.7.0"):
-            vm.update(data={"disk": total_disk_mb}, source=self)
+            vm.update(data={"disk": total_disk}, source=self)
             return
 
         if disk_gb is not None:
             self._sync_virtual_disk(
-                vm, "root", int(disk_gb) * 1024, "DigitalOcean Droplet root disk"
+                vm, "root", int(disk_gb) * disk_factor, "DigitalOcean Droplet root disk"
             )
         for volume in attached_volumes:
             self._sync_virtual_disk(
                 vm,
                 f"do-{volume['id']}"[:64],
-                int(volume.get("size_gigabytes", 0)) * 1024,
+                int(volume.get("size_gigabytes", 0)) * disk_factor,
                 volume.get("name"),
             )
 
@@ -351,12 +408,13 @@ class DigitalOceanHandler(SourceBase):
             return
 
         vm_data = {
-            "name": f"db-{name}"[:64],
+            "name": self._vm_name(database, cluster, "database"),
             "cluster": cluster,
             "status": "active" if database.get("status") == "online" else "offline",
-            "serial": str(database.get("id")) if database.get("id") is not None else None,
             "comments": "DigitalOcean managed database cluster",
         }
+        if version.parse(self.inventory.netbox_api_version) >= version.parse("4.1.0"):
+            vm_data["serial"] = str(database.get("id")) if database.get("id") is not None else None
         engine = database.get("engine")
         db_version = database.get("version")
         platform = " ".join(str(value) for value in (engine, db_version) if value)
@@ -385,14 +443,17 @@ class DigitalOceanHandler(SourceBase):
         })
         if custom_fields:
             vm_data["custom_fields"] = custom_fields
-        vm = self.inventory.add_update_object(NBVM, data=vm_data, source=self)
+        vm = self._sync_vm(vm_data)
 
         storage_size = database.get("storage_size_mib")
         if storage_size is not None:
+            storage_size = int(storage_size)
+            if version.parse(self.inventory.netbox_api_version) < version.parse("4.1.0"):
+                storage_size //= 1024
             if version.parse(self.inventory.netbox_api_version) < version.parse("3.7.0"):
-                vm.update(data={"disk": int(storage_size)}, source=self)
+                vm.update(data={"disk": storage_size}, source=self)
             else:
-                self._sync_virtual_disk(vm, "database-storage", int(storage_size), "Managed database storage")
+                self._sync_virtual_disk(vm, "database-storage", storage_size, "Managed database storage")
 
     def _custom_fields(self, values):
         custom_fields = {}
@@ -419,13 +480,13 @@ class DigitalOceanHandler(SourceBase):
                 source=self,
             )
 
-    def _sync_virtual_disk(self, vm, name, size_mb, description=None):
+    def _sync_virtual_disk(self, vm, name, size, description=None):
         self.inventory.add_update_object(
             NBVirtualDisk,
             data={
                 "name": name,
                 "virtual_machine": vm,
-                "size": size_mb,
+                "size": size,
                 "description": description,
             },
             source=self,
