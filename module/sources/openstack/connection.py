@@ -122,6 +122,8 @@ class OpenStackHandler(SourceBase):
 
         try:
             self.session = openstack.connect(
+                load_yaml_config=False,
+                load_envvars=False,
                 auth_url=self.settings.auth_url,
                 project_name=self.settings.project,
                 username=self.settings.username,
@@ -675,6 +677,50 @@ class OpenStackHandler(SourceBase):
         if exclude_filter is not None:
             nic_data = {name: data for name, data in nic_data.items() if not exclude_filter.match(name)}
 
+        mac_matched_interfaces = set()
+        if object_type == NBVM:
+            current_by_mac = {}
+            for interface in self.inventory.get_all_interfaces(device_vm_object):
+                existing_name = grab(interface, "data.name")
+                if exclude_filter is not None and existing_name is not None and exclude_filter.match(existing_name):
+                    continue
+                if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
+                    mac = grab(interface, "data.primary_mac_address.data.mac_address")
+                else:
+                    mac = grab(interface, "data.mac_address")
+                if mac:
+                    current_by_mac.setdefault(normalize_mac_address(mac), []).append(interface)
+            names_by_mac = {}
+            for int_name, int_data in nic_data.items():
+                mac = int_data.get("mac_address")
+                matches = current_by_mac.get(normalize_mac_address(mac), []) if mac else []
+                if len(matches) > 1:
+                    message = f"Multiple interfaces of OpenStack VM '{object_name}' match MAC '{mac}'."
+                    log.error(message)
+                    raise ValueError(message)
+                if matches:
+                    names_by_mac[int_name] = matches[0].data["name"]
+                    mac_matched_interfaces.add(matches[0])
+            used_names = set(names_by_mac.values())
+            remapped_data = {}
+            remapped_ips = {}
+            for int_name, int_data in nic_data.items():
+                target_name = names_by_mac.get(int_name, int_name)
+                if int_name not in names_by_mac:
+                    index = 1
+                    network_label = int_name.partition(" ")[2]
+                    while target_name in used_names:
+                        target_name = f"vNIC{index} {network_label}"
+                        index += 1
+                used_names.add(target_name)
+                if int_name not in names_by_mac:
+                    int_data["description"] = target_name
+                int_data["name"] = target_name
+                remapped_data[target_name] = int_data
+                remapped_ips[target_name] = nic_ips.get(int_name, [])
+            nic_data = remapped_data
+            nic_ips = remapped_ips
+
         # map interfaces of existing object with discovered interfaces
         nic_object_dict = self.map_object_interfaces_to_current_interfaces(device_vm_object, nic_data)
 
@@ -700,7 +746,8 @@ class OpenStackHandler(SourceBase):
             existing_interface = nic_object_dict.get(int_name)
             if existing_interface is not None:
                 existing_name = grab(existing_interface, "data.name")
-                if existing_name is not None:
+                if existing_name is not None and (
+                        object_type == NBDevice or existing_interface in mac_matched_interfaces):
                     int_data["name"] = existing_name
                 if object_type == NBDevice:
                     int_data.pop("type", None)
@@ -1250,14 +1297,18 @@ class OpenStackHandler(SourceBase):
         if version.parse(self.inventory.netbox_api_version) >= version.parse("3.7.0"):
             for disk_name, disk_size in disks.items():
                 data = {"name": disk_name, "virtual_machine": vm}
+                existing = next((disk for disk in vm.get_virtual_disks()
+                                 if disk.data.get("name") == disk_name), None)
                 if disk_size is None:
-                    existing = self.inventory.get_by_data(NBVirtualDisk, data=data)
                     if existing is not None:
                         existing.update(data=data, source=self)
                     continue
                 multiplier = 1000 if version.parse(self.inventory.netbox_api_version) >= version.parse("4.1.0") else 1
                 data["size"] = disk_size * multiplier
-                self.inventory.add_update_object(NBVirtualDisk, data=data, source=self)
+                if existing is None:
+                    self.inventory.add_object(NBVirtualDisk, data=data, source=self)
+                else:
+                    existing.update(data=data, source=self)
 
         return
 
