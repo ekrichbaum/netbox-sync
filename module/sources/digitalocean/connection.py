@@ -14,7 +14,7 @@ from module.common.logging import get_logger
 from module.common.misc import do_error_exit
 from module.netbox import (
     NBCustomField, NBCluster, NBClusterGroup, NBClusterType, NBIPAddress, NBPlatform,
-    NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk, NetBoxObject,
+    NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk, NBVRF, NetBoxObject,
 )
 from module.netbox.inventory import NetBoxInventory
 from module.netbox.connection import NetBoxHandler
@@ -32,7 +32,7 @@ class DigitalOceanHandler(SourceBase):
 
     dependent_netbox_objects = [
         NBCustomField, NBCluster, NBClusterGroup, NBClusterType, NBIPAddress, NBPlatform,
-        NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk,
+        NBRegion, NBTag, NBVM, NBVMInterface, NBVirtualDisk, NBVRF,
     ]
 
     def __init__(self, name=None):
@@ -323,7 +323,8 @@ class DigitalOceanHandler(SourceBase):
                     },
                     source=self,
                 )
-                ip_object = self._sync_ip(ip_obj, interface)
+                vrf = self._get_private_ip_vrf() if interface_name == "private" else None
+                ip_object = self._sync_ip(ip_obj, interface, vrf=vrf)
                 if ip_object is None:
                     continue
                 ip_version = ip_obj.version
@@ -349,8 +350,22 @@ class DigitalOceanHandler(SourceBase):
             prefix = 32 if ":" not in ip_value else 128
         return ip_interface(f"{ip_value}/{prefix}")
 
-    def _sync_ip(self, ip_obj, interface):
-        claim_key = str(ip_obj.ip)
+    def _get_private_ip_vrf(self):
+        name = self.settings.private_ip_vrf
+        if name is None:
+            return None
+        candidates = [vrf for vrf in self.inventory.get_all_items(NBVRF) if vrf.data.get("name") == name]
+        if len(candidates) > 1:
+            do_error_exit(f"Multiple NetBox VRFs match private_ip_vrf '{name}' for source '{self.name}'.")
+        if candidates:
+            vrf = candidates[0]
+            if self.source_tag in vrf.get_tags():
+                vrf.set_source(self)
+            return vrf
+        return self.inventory.add_object(NBVRF, data={"name": name}, source=self)
+
+    def _sync_ip(self, ip_obj, interface, vrf=None):
+        claim_key = (str(ip_obj.ip), vrf)
         previous_claim = self._ip_claims.get(claim_key)
         if previous_claim is not None and previous_claim is not interface:
             message = (f"DigitalOcean source '{self.name}' reports IP '{ip_obj}' on multiple interfaces. "
@@ -360,10 +375,21 @@ class DigitalOceanHandler(SourceBase):
 
         ip_data = {
             "address": str(ip_obj),
+            "vrf": vrf,
             "assigned_object_type": "virtualization.vminterface",
             "assigned_object_id": interface,
         }
-        existing = self.inventory.get_by_data(NBIPAddress, data={"address": str(ip_obj)})
+        candidates = [
+            item for item in self.inventory.get_all_items(NBIPAddress)
+            if ip_interface(item.data["address"]).ip == ip_obj.ip and item.data.get("vrf") is vrf
+        ]
+        if len(candidates) > 1:
+            vrf_name = vrf.get_display_name() if vrf is not None else "global"
+            do_error_exit(
+                f"Multiple NetBox IPs match '{ip_obj.ip}' in VRF '{vrf_name}' for source '{self.name}': "
+                f"{[item.nb_id for item in candidates]}. Resolve the duplicate records before retrying."
+            )
+        existing = candidates[0] if candidates else None
         if existing is not None:
             assigned_object = existing.data.get("assigned_object_id")
             if assigned_object is not None and assigned_object is not interface:
@@ -374,9 +400,25 @@ class DigitalOceanHandler(SourceBase):
                     bool(source_tags - {self.source_tag})
                 )
                 if not same_source or other_source:
+                    assigned_vm = (
+                        assigned_object.data.get("virtual_machine")
+                        if isinstance(assigned_object, NBVMInterface) else None
+                    )
+                    vrf = existing.data.get("vrf")
+                    vrf_name = vrf.get_display_name() if isinstance(vrf, NetBoxObject) else vrf
+                    owner_name = getattr(existing.source, "name", None)
+                    owner_vm_tags = sorted(assigned_vm.get_tags()) if assigned_vm is not None else []
+                    assigned_name = (
+                        assigned_object.get_display_name()
+                        if isinstance(assigned_object, NetBoxObject) else str(assigned_object)
+                    )
                     message = (
                         f"DigitalOcean IP '{ip_obj}' has conflicting or uncertain source ownership; "
                         f"cannot reassign it for source '{self.name}'. "
+                        f"Existing NetBox IP ID {existing.nb_id}, VRF={vrf_name!r}, "
+                        f"assigned to '{assigned_name}', "
+                        f"IP source tags={sorted(source_tags)}, current-run source={owner_name!r}, "
+                        f"assigned VM tags={owner_vm_tags}. "
                         f"Skipping assignment to '{interface.get_display_name()}'; resolve the existing assignment."
                     )
                     log.error(message)
@@ -386,7 +428,11 @@ class DigitalOceanHandler(SourceBase):
                     return None
                 log.info(f"Repairing DigitalOcean IP '{ip_obj}' assignment for source '{self.name}' "
                          f"to interface '{interface.get_display_name()}'.")
-        result = self.inventory.add_update_object(NBIPAddress, data=ip_data, source=self)
+        if existing is None:
+            result = self.inventory.add_object(NBIPAddress, data=ip_data, source=self)
+        else:
+            existing.update(data=ip_data, source=self)
+            result = existing
         self._ip_claims[claim_key] = interface
         return result
 
