@@ -8,9 +8,11 @@
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
 import pprint
+from collections import Counter
 from ipaddress import ip_interface
 from importlib import import_module
 from urllib.parse import unquote
+from uuid import UUID
 
 from packaging import version
 
@@ -71,6 +73,8 @@ class OpenStackHandler(SourceBase):
         self.inventory = NetBoxInventory()
         self.name = name
         self.session = None
+        self._server_snapshot_ids = None
+        self._server_ip_counts = Counter()
         self.init_successful = False
 
         # parse settings
@@ -158,6 +162,8 @@ class OpenStackHandler(SourceBase):
         Every update of new/existing objects fot this source has to happen here.
         """
 
+        self._server_snapshot_ids = None
+        self._server_ip_counts.clear()
         log.info(f"Query data from OpenStack: '{self.settings.auth_url}'")
         self.permitted_clusters.clear()
         self.cluster_host_map.clear()
@@ -180,12 +186,63 @@ class OpenStackHandler(SourceBase):
         for volume in volumes:
             self.add_volume(volume)
 
-        servers = self.session.compute.servers(details=True, all_projects=self.settings.all_projects)
+        servers = list(self.session.compute.servers(details=True, all_projects=self.settings.all_projects))
+        snapshot_ids = set()
+        for server in servers:
+            try:
+                snapshot_ids.add(str(UUID(str(server.id))))
+            except (ValueError, AttributeError):
+                log.warning("OpenStack server snapshot contains an invalid UUID; stale IP repair is disabled.")
+                break
+        else:
+            self._server_snapshot_ids = snapshot_ids
+        for server in servers:
+            addresses = set()
+            for network_addresses in (grab(server, "addresses") or {}).values():
+                for address in network_addresses:
+                    try:
+                        addresses.add(str(ip_interface(address["addr"]).ip))
+                    except (KeyError, ValueError):
+                        continue
+            self._server_ip_counts.update(addresses)
         # Prefer an already-associated server before using status to break ties.
-        for server in sorted(servers, key=self.get_server_priority):
-            self.add_virtual_machine(server)
+        try:
+            for server in sorted(servers, key=self.get_server_priority):
+                self.add_virtual_machine(server)
+            self.update_basic_data()
+        finally:
+            self._server_snapshot_ids = None
 
-        self.update_basic_data()
+    def can_reassign_stale_ip(self, ip, device_vm_object):
+        if self._server_snapshot_ids is None or not self.settings.all_projects:
+            return False
+        old_vm = ip.get_device_vm()
+        if not isinstance(old_vm, NBVM) or not isinstance(device_vm_object, NBVM):
+            return False
+        if old_vm.source is not None or device_vm_object.source is not self:
+            return False
+        for item in (ip, old_vm):
+            source_tags = {tag for tag in item.get_tags() if tag.startswith("Source: ")}
+            if source_tags != {self.source_tag}:
+                return False
+        if ip.source is not None and ip.source is not self:
+            return False
+        identity_key = "name" if self.settings.set_vm_name_to_uuid else "comments"
+        try:
+            old_id = str(UUID(str(old_vm.data.get(identity_key))))
+            current_id = str(UUID(str(device_vm_object.data.get(identity_key))))
+        except ValueError:
+            return False
+        address = str(ip_interface(ip.data["address"]).ip)
+        if old_id in self._server_snapshot_ids or current_id not in self._server_snapshot_ids or \
+                self._server_ip_counts[address] != 1:
+            return False
+        log.info(
+            f"Reclaiming OpenStack IP '{ip.data['address']}' (NetBox ID {ip.nb_id}) from VM "
+            f"'{old_vm.get_display_name()}' (UUID {old_id}), absent from the complete server snapshot, "
+            f"to '{device_vm_object.get_display_name()}' (UUID {current_id}) for source '{self.name}'."
+        )
+        return True
 
     @staticmethod
     def passes_filter(name, include_filter, exclude_filter):
@@ -515,12 +572,6 @@ class OpenStackHandler(SourceBase):
                 compute_host_names.append(hostname)
 
         return compute_host_names
-
-    def object_synced_by_other_source(self, nb_object):
-        if nb_object.source is not None:
-            return nb_object.source is not self
-        other_tags = [source.source_tag for source in self.inventory.source_list if source is not self]
-        return bool(set(nb_object.get_tags()).intersection(other_tags))
 
     def add_custom_attributes(self, object_type, obj, data):
         attributes = self.settings.host_custom_object_attributes if object_type == NBDevice else \
