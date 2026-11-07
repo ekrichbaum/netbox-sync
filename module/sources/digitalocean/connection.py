@@ -78,6 +78,16 @@ class DigitalOceanHandler(SourceBase):
             f"Connected to DigitalOcean, found {len(droplets)} droplets, "
             f"{len(volumes)} volumes and {len(databases)} database clusters"
         )
+        if self.settings.private_ip_vrf is None:
+            self.log.info(
+                f"DigitalOcean source '{self.name}': private_ip_vrf is unset; "
+                "private addresses use the global table."
+            )
+        else:
+            self.log.info(
+                f"DigitalOcean source '{self.name}': private addresses use VRF "
+                f"'{self.settings.private_ip_vrf}'; public addresses use the global table."
+            )
 
         cluster_group = self.inventory.add_update_object(
             NBClusterGroup,
@@ -375,10 +385,11 @@ class DigitalOceanHandler(SourceBase):
 
         ip_data = {
             "address": str(ip_obj),
-            "vrf": vrf,
             "assigned_object_type": "virtualization.vminterface",
             "assigned_object_id": interface,
         }
+        if vrf is not None:
+            ip_data["vrf"] = vrf
         candidates = [
             item for item in self.inventory.get_all_items(NBIPAddress)
             if ip_interface(item.data["address"]).ip == ip_obj.ip and item.data.get("vrf") is vrf
@@ -412,11 +423,18 @@ class DigitalOceanHandler(SourceBase):
                         assigned_object.get_display_name()
                         if isinstance(assigned_object, NetBoxObject) else str(assigned_object)
                     )
+                    assigned_cluster = assigned_vm.data.get("cluster") if assigned_vm is not None else None
+                    assigned_cluster_name = (
+                        assigned_cluster.get_display_name() if assigned_cluster is not None else None
+                    )
                     message = (
                         f"DigitalOcean IP '{ip_obj}' has conflicting or uncertain source ownership; "
                         f"cannot reassign it for source '{self.name}'. "
                         f"Existing NetBox IP ID {existing.nb_id}, VRF={vrf_name!r}, "
                         f"assigned to '{assigned_name}', "
+                        f"assigned interface ID {getattr(assigned_object, 'nb_id', None)}, "
+                        f"assigned VM ID {assigned_vm.nb_id if assigned_vm is not None else None}, "
+                        f"assigned cluster={assigned_cluster_name!r}, target interface ID {interface.nb_id}, "
                         f"IP source tags={sorted(source_tags)}, current-run source={owner_name!r}, "
                         f"assigned VM tags={owner_vm_tags}. "
                         f"Skipping assignment to '{interface.get_display_name()}'; resolve the existing assignment."
