@@ -22,6 +22,7 @@ from module.common.logging import get_logger, DEBUG3
 from module.common.misc import grab, dump, get_string_or_none
 from module.common.support import normalize_mac_address
 from module.netbox.inventory import NetBoxInventory
+from module.netbox.connection import NetBoxHandler
 from module.netbox import *
 
 log = get_logger()
@@ -235,13 +236,26 @@ class OpenStackHandler(SourceBase):
             )
         if device_vm_object.source is not self:
             return blocked("the target VM is not owned by this source in this run")
+        recovered_orphan_ownership = False
         for item in (ip, old_vm):
             source_tags = {tag for tag in item.get_tags() if tag.startswith("Source: ")}
             if source_tags != {self.source_tag}:
-                return blocked(
-                    f"{item.name} '{item.get_display_name()}' (NetBox ID {item.nb_id}) has "
-                    f"source tags {sorted(source_tags)}; expected only '{self.source_tag}'"
-                )
+                if source_tags or NetBoxHandler.orphaned_tag not in item.get_tags():
+                    return blocked(
+                        f"{item.name} '{item.get_display_name()}' (NetBox ID {item.nb_id}) has "
+                        f"source tags {sorted(source_tags)}; expected only '{self.source_tag}' "
+                        "or an orphaned record with verified cluster ownership"
+                    )
+                recovered_orphan_ownership = True
+        if recovered_orphan_ownership:
+            cluster = old_vm.data.get("cluster")
+            cluster_tags = {tag for tag in cluster.get_tags() if tag.startswith("Source: ")} \
+                if isinstance(cluster, NBCluster) else set()
+            if not isinstance(cluster, NBCluster) or cluster.source is not self or \
+                    cluster_tags != {self.source_tag} or \
+                    self.get_object_from_cache(NBCluster, cluster.data.get("name")) is not cluster or \
+                    grab(cluster, "data.group.data.name") != self.settings.group_name:
+                return blocked("orphaned records lack an exclusively source-owned cluster in current discovery")
         if ip.source is not None and ip.source is not self:
             return blocked(f"IP was claimed by another source '{getattr(ip.source, 'name', None)}'")
         identity_key = "name" if self.settings.set_vm_name_to_uuid else "comments"
@@ -266,6 +280,8 @@ class OpenStackHandler(SourceBase):
             f"Reclaiming OpenStack IP '{ip.data['address']}' (NetBox ID {ip.nb_id}) from VM "
             f"'{old_vm.get_display_name()}' (UUID {old_id}), absent from the complete server snapshot, "
             f"to '{device_vm_object.get_display_name()}' (UUID {current_id}) for source '{self.name}'."
+            + (" Recovered missing orphan Source tags using verified cluster ownership."
+               if recovered_orphan_ownership else "")
         )
         return True
 
