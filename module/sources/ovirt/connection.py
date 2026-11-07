@@ -8,21 +8,16 @@
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
 import pprint
-import socket
-from ipaddress import ip_address, ip_interface
+from collections import Counter
+from ipaddress import ip_interface
+from importlib import import_module
+from urllib.parse import unquote
+from uuid import UUID
 
 from packaging import version
-try:
-    import ovirtsdk4 as sdk
-    import ovirtsdk4.types as types
-except ModuleNotFoundError as exc:
-    if exc.name != "ovirtsdk4":
-        raise
-    sdk = None
-    types = None
 
 from module.sources.common.source_base import SourceBase
-from module.sources.ovirt.config import OVirtConfig
+from module.sources.openstack.config import OpenStackConfig
 from module.common.logging import get_logger, DEBUG3
 from module.common.misc import grab, dump, get_string_or_none
 from module.common.support import normalize_mac_address
@@ -33,9 +28,9 @@ log = get_logger()
 
 
 # noinspection PyTypeChecker
-class OVirtHandler(SourceBase):
+class OpenStackHandler(SourceBase):
     """
-    Source class to import data from a oVirt instance and add/update NetBox objects based on gathered information
+    Source class to import data from a Openstack instance and add/update NetBox objects based on gathered information
     """
 
     dependent_netbox_objects = [
@@ -50,6 +45,7 @@ class OVirtHandler(SourceBase):
         NBCluster,
         NBDevice,
         NBVM,
+        NBVirtualDisk,
         NBVMInterface,
         NBInterface,
         NBIPAddress,
@@ -57,17 +53,16 @@ class OVirtHandler(SourceBase):
         NBTenant,
         NBVRF,
         NBVLAN,
-        NBCustomField,
+        NBVLANGroup,
         NBMACAddress,
-        NBVirtualDisk
+        NBFHRPGroupItem,
+        NBCustomField
     ]
 
-    source_type = "ovirt"
+    source_type = "openstack"
 
     # internal vars
     session = None
-    tag_session = None
-
     site_name = None
 
     def __init__(self, name=None):
@@ -77,20 +72,24 @@ class OVirtHandler(SourceBase):
 
         self.inventory = NetBoxInventory()
         self.name = name
+        self.session = None
+        self._server_snapshot_ids = None
+        self._server_ip_counts = Counter()
+        self.init_successful = False
 
         # parse settings
-        settings_handler = OVirtConfig()
+        settings_handler = OpenStackConfig()
         settings_handler.source_name = self.name
         self.settings = settings_handler.parse()
 
         self.set_source_tag()
-        self.site_name = f"oVirt: {name}"
+        self.site_name = f"OpenStack: {name}"
 
         if self.settings.enabled is False:
             log.info(f"Source '{name}' is currently disabled. Skipping")
             return
 
-        self.create_ovirt_session()
+        self.create_openstack_session()
 
         if self.session is None:
             log.info(f"Source '{name}' is currently unavailable. Skipping")
@@ -98,16 +97,15 @@ class OVirtHandler(SourceBase):
 
         self.init_successful = True
         self.permitted_clusters = dict()
+        self.cluster_host_map = dict()
+        self.volume_map = dict()
         self.processed_host_names = dict()
         self.processed_vm_names = dict()
-        self.processed_vm_uuid = list()
         self.object_cache = dict()
-        self.parsing_vms_the_first_time = True
-        self.disk_cache = dict()
 
-    def create_ovirt_session(self):
+    def create_openstack_session(self):
         """
-        Initialize session with oVirt
+        Initialize session with OpenStack
 
         Returns
         -------
@@ -117,41 +115,44 @@ class OVirtHandler(SourceBase):
         if self.session is not None:
             return True
 
-        if sdk is None:
-            log.error("The oVirt SDK is missing. Install dependencies from requirements-ovirt.txt.")
+        log.debug(f"Starting OpenStack connection to '{self.settings.auth_url}'")
+
+        try:
+            openstack = import_module("openstack")
+        except ImportError:
+            log.error("OpenStack source requires openstacksdk. Install with "
+                      "'pip install -r requirements-openstack.txt' or 'uv sync --extra openstack'.")
             return False
 
-        log.debug(f"Starting oVirt connection to '{self.settings.url}'")
-
-        session = None
         try:
-            session = sdk.Connection(
-                url=self.settings.url,
+            self.session = openstack.connect(
+                load_yaml_config=False,
+                load_envvars=False,
+                auth_url=self.settings.auth_url,
+                project_name=self.settings.project,
                 username=self.settings.username,
                 password=self.settings.password,
-                ca_file=self.settings.ca_file,
-                insecure=(not self.settings.validate_tls_certs),
-                debug=False,
-                log=log,
+                region_name=self.settings.region,
+                user_domain_name=self.settings.user_domain,
+                project_domain_name=self.settings.project_domain,
+                verify=self.settings.validate_tls_certs,
+                app_name='netbox-sync',
+                app_version='0.1',
             )
-            session.test(raise_exception=True)
+            self.session.authorize()
         except Exception as e:
-            if session is not None:
-                try:
-                    session.close()
-                except Exception as close_error:
-                    log.warning(f"Unable to close failed oVirt session: {close_error}")
-            log.error(f"Unable to connect to oVirt instance '{self.settings.url}'. {e}")
+            log.error(f"Unable to connect to OpenStack instance '{self.settings.auth_url}': {e}")
+            self.finish()
             return False
 
-        self.session = session
-        log.info(f"Successfully connected to oVirt '{self.settings.url}'")
+        log.info(f"Successfully connected to OpenStack '{self.settings.auth_url}'")
 
         return True
 
     def finish(self):
         if self.session is not None:
             self.session.close()
+            self.session = None
 
     def apply(self):
         """
@@ -161,47 +162,87 @@ class OVirtHandler(SourceBase):
         Every update of new/existing objects fot this source has to happen here.
         """
 
-        log.info(f"Query data from oVirt: '{self.settings.url}'")
+        self._server_snapshot_ids = None
+        self._server_ip_counts.clear()
+        log.info(f"Query data from OpenStack: '{self.settings.auth_url}'")
+        self.permitted_clusters.clear()
+        self.cluster_host_map.clear()
+        self.volume_map.clear()
+        self.processed_host_names.clear()
+        self.processed_vm_names.clear()
+        self.object_cache.clear()
 
-        """
-        Mapping of object type keywords to view types and handlers
+        self.inventory.add_update_object(NBClusterGroup, data={"name": self.settings.group_name}, source=self)
 
-        iterate over all VMs twice.
+        availability_zones = self.session.compute.availability_zones(details=True)
+        for availability_zone in availability_zones:
+            self.add_cluster(availability_zone)
 
-        To handle VMs with the same name in a cluster we first
-        iterate over all VMs and look only at the active ones
-        and sync these first.
-        Then we iterate a second time to catch the rest.
+        hypervisors = self.session.compute.hypervisors(details=True)
+        for hypervisor in hypervisors:
+            self.add_host(hypervisor)
 
-        This has been implemented to support migration scenarios
-        where you create the same machines with a different setup
-        like a new version or something. This way NetBox will be
-        updated primarily with the actual active VM data.
-        """
+        volumes = self.session.block_storage.volumes(details=True, all_projects=self.settings.all_projects)
+        for volume in volumes:
+            self.add_volume(volume)
 
-        system_service = self.session.system_service()
+        servers = list(self.session.compute.servers(details=True, all_projects=self.settings.all_projects))
+        snapshot_ids = set()
+        for server in servers:
+            try:
+                snapshot_ids.add(str(UUID(str(server.id))))
+            except (ValueError, AttributeError):
+                log.warning("OpenStack server snapshot contains an invalid UUID; stale IP repair is disabled.")
+                break
+        else:
+            self._server_snapshot_ids = snapshot_ids
+        for server in servers:
+            addresses = set()
+            for network_addresses in (grab(server, "addresses") or {}).values():
+                for address in network_addresses:
+                    try:
+                        addresses.add(str(ip_interface(address["addr"]).ip))
+                    except (KeyError, ValueError):
+                        continue
+            self._server_ip_counts.update(addresses)
+        # Prefer an already-associated server before using status to break ties.
+        try:
+            for server in sorted(servers, key=self.get_server_priority):
+                self.add_virtual_machine(server)
+            self.update_basic_data()
+        finally:
+            self._server_snapshot_ids = None
 
-        disks = system_service.disks_service().list()
-        for disk in disks:
-            self.disk_cache[disk.id] = disk
-
-        datacenters = system_service.data_centers_service().list()
-        for datacenter in datacenters:
-            self.add_datacenter(datacenter)
-
-        clusters = system_service.clusters_service().list()
-        for cluster in clusters:
-            self.add_cluster(cluster)
-
-        hosts = system_service.hosts_service().list(follow="nics")
-        for host in hosts:
-            self.add_host(host)
-
-        vms = system_service.vms_service().list(follow="nics,disk_attachments,reported_devices")
-        for vm in sorted(vms, key=lambda item: item.status != types.VmStatus.UP):
-            self.add_virtual_machine(vm)
-
-        self.update_basic_data()
+    def can_reassign_stale_ip(self, ip, device_vm_object):
+        if self._server_snapshot_ids is None or not self.settings.all_projects:
+            return False
+        old_vm = ip.get_device_vm()
+        if not isinstance(old_vm, NBVM) or not isinstance(device_vm_object, NBVM):
+            return False
+        if old_vm.source is not None or device_vm_object.source is not self:
+            return False
+        for item in (ip, old_vm):
+            source_tags = {tag for tag in item.get_tags() if tag.startswith("Source: ")}
+            if source_tags != {self.source_tag}:
+                return False
+        if ip.source is not None and ip.source is not self:
+            return False
+        identity_key = "name" if self.settings.set_vm_name_to_uuid else "comments"
+        try:
+            old_id = str(UUID(str(old_vm.data.get(identity_key))))
+            current_id = str(UUID(str(device_vm_object.data.get(identity_key))))
+        except ValueError:
+            return False
+        address = str(ip_interface(ip.data["address"]).ip)
+        if old_id in self._server_snapshot_ids or current_id not in self._server_snapshot_ids or \
+                self._server_ip_counts[address] != 1:
+            return False
+        log.info(
+            f"Reclaiming OpenStack IP '{ip.data['address']}' (NetBox ID {ip.nb_id}) from VM "
+            f"'{old_vm.get_display_name()}' (UUID {old_id}), absent from the complete server snapshot, "
+            f"to '{device_vm_object.get_display_name()}' (UUID {current_id}) for source '{self.name}'."
+        )
+        return True
 
     @staticmethod
     def passes_filter(name, include_filter, exclude_filter):
@@ -320,18 +361,16 @@ class OVirtHandler(SourceBase):
 
         for interface in self.inventory.get_all_items(interface_typ):
 
-            if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
-                mac = grab(grab(interface, "data.primary_mac_address"), "data.mac_address")
-            else:
-                mac = grab(interface, "data.mac_address")
-            if mac in mac_list:
+            mac_address = grab(interface, "data.primary_mac_address.data.mac_address") or \
+                grab(interface, "data.mac_address")
+            if mac_address in mac_list:
 
                 matching_object = grab(interface, f"data.{interface.secondary_key}")
                 if not isinstance(matching_object, (NBDevice, NBVM)):
                     continue
 
                 log.debug2("Found matching MAC '%s' on %s '%s'" %
-                           (mac, object_type.name,
+                           (grab(interface, "data.mac_address"), object_type.name,
                             matching_object.get_display_name(including_second_key=True)))
 
                 if objects_with_matching_macs.get(matching_object) is None:
@@ -405,8 +444,7 @@ class OVirtHandler(SourceBase):
                     ip = grab(device_primary_ip, "address")
 
                 elif isinstance(device_primary_ip, NBIPAddress):
-                    ip = grab(device_primary_ip, "data.address")
-
+                    ip = device_primary_ip.data.get("address")
                 elif isinstance(device_primary_ip, int):
                     ip = self.inventory.get_by_id(NBIPAddress, nb_id=device_primary_ip)
                     ip = grab(ip, "data.address")
@@ -492,9 +530,71 @@ class OVirtHandler(SourceBase):
 
             return resolved_name
 
+    def get_cluster_for_host(self, hostname):
+        for cluster, hosts in self.cluster_host_map.items():
+            if hostname in hosts:
+                return cluster
+        return None
+
+    def get_server_priority(self, server):
+        name = get_string_or_none(grab(server, "name"))
+        if name is not None and self.settings.strip_vm_domain_name:
+            name = name.split(".")[0]
+        if self.settings.set_vm_name_to_uuid:
+            name = get_string_or_none(grab(server, "id"))
+
+        cluster_name = get_string_or_none(grab(server, "availability_zone"))
+        cluster = self.get_object_from_cache(NBCluster, cluster_name)
+        if name is not None and cluster is not None and not self.settings.skip_vm_comments:
+            existing_vm = self.inventory.get_by_data(
+                NBVM, data={"name": name, "cluster": cluster}
+            )
+            if grab(existing_vm, "data.comments") == get_string_or_none(grab(server, "id")):
+                return 0, server.status != "ACTIVE"
+
+        return 1, server.status != "ACTIVE"
+
+    @staticmethod
+    def get_compute_host_names(hosts):
+        compute_host_names = []
+        for hostname, services in (hosts or {}).items():
+            if not isinstance(services, dict) or not services:
+                compute_host_names.append(hostname)
+                continue
+
+            service_names = {str(name).lower() for name in services}
+            service_names.update(
+                str(grab(service, "binary", fallback="")).lower()
+                for service in services.values()
+            )
+            has_nova_services = any(name.startswith("nova-") for name in service_names)
+            if not has_nova_services or "nova-compute" in service_names:
+                compute_host_names.append(hostname)
+
+        return compute_host_names
+
+    def object_synced_by_other_source(self, nb_object):
+        if nb_object.source is not None:
+            return nb_object.source is not self
+        other_tags = [source.source_tag for source in self.inventory.source_list if source is not self]
+        return bool(set(nb_object.get_tags()).intersection(other_tags))
+
+    def add_custom_attributes(self, object_type, obj, data):
+        attributes = self.settings.host_custom_object_attributes if object_type == NBDevice else \
+            self.settings.vm_custom_object_attributes
+        for attribute in attributes or []:
+            value = grab(obj, attribute)
+            if value is None:
+                continue
+            field = self.add_update_custom_field({
+                "name": f"openstack_{attribute}", "label": attribute[:50],
+                "object_types": [object_type.object_type], "type": "text",
+                "description": f"OpenStack resource attribute '{attribute}'",
+            })
+            data.setdefault("custom_fields", {})[field.data["name"]] = str(value)
+
     def add_device_vm_to_inventory(self, object_type, object_data, pnic_data=None, vnic_data=None,
-                                   nic_ips=None, p_ipv4=None, p_ipv6=None, ovirt_object=None,
-                                   keep_undiscovered_ips=False):
+                                   nic_ips=None, p_ipv4=None, p_ipv6=None):
         """
         Add/update device/VM object in inventory based on gathered data.
 
@@ -612,9 +712,6 @@ class OVirtHandler(SourceBase):
         else:
             device_vm_object.update(data=object_data, source=self)
 
-        # add object to cache
-        self.add_object_to_cache(ovirt_object, device_vm_object)
-
         # update role according to config settings
         object_name = object_data.get(object_type.primary_key)
         role_name = self.get_object_relation(object_name,
@@ -630,24 +727,56 @@ class OVirtHandler(SourceBase):
         # compile all nic data into one dictionary
         if object_type == NBVM:
             nic_data = vnic_data
-            interface_exclude_filter = self.settings.vm_interface_exclude_filter
         else:
             nic_data = {**pnic_data, **vnic_data}
-            interface_exclude_filter = self.settings.host_interface_exclude_filter
+        exclude_filter = self.settings.vm_interface_exclude_filter if object_type == NBVM else \
+            self.settings.host_interface_exclude_filter
+        if exclude_filter is not None:
+            nic_data = {name: data for name, data in nic_data.items() if not exclude_filter.match(name)}
 
-        if interface_exclude_filter is not None:
+        mac_matched_interfaces = set()
+        if object_type == NBVM:
+            current_by_mac = {}
             for interface in self.inventory.get_all_interfaces(device_vm_object):
-                interface_name = grab(interface, "data.name")
-                if interface_name is not None and interface_exclude_filter.match(interface_name) and \
-                        self.source_tag in interface.get_tags():
-                    interface.set_source(self)
-
-            for interface_name in list(nic_data):
-                if interface_exclude_filter.match(interface_name):
-                    log.debug(f"Discovered interface '{interface_name}' matches interface_exclude_filter. "
-                              "Excluding it from sync")
-                    del nic_data[interface_name]
-                    nic_ips.pop(interface_name, None)
+                existing_name = grab(interface, "data.name")
+                if exclude_filter is not None and existing_name is not None and exclude_filter.match(existing_name):
+                    continue
+                if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
+                    mac = grab(interface, "data.primary_mac_address.data.mac_address")
+                else:
+                    mac = grab(interface, "data.mac_address")
+                if mac:
+                    current_by_mac.setdefault(normalize_mac_address(mac), []).append(interface)
+            names_by_mac = {}
+            for int_name, int_data in nic_data.items():
+                mac = int_data.get("mac_address")
+                matches = current_by_mac.get(normalize_mac_address(mac), []) if mac else []
+                if len(matches) > 1:
+                    message = f"Multiple interfaces of OpenStack VM '{object_name}' match MAC '{mac}'."
+                    log.error(message)
+                    raise ValueError(message)
+                if matches:
+                    names_by_mac[int_name] = matches[0].data["name"]
+                    mac_matched_interfaces.add(matches[0])
+            used_names = set(names_by_mac.values())
+            remapped_data = {}
+            remapped_ips = {}
+            for int_name, int_data in nic_data.items():
+                target_name = names_by_mac.get(int_name, int_name)
+                if int_name not in names_by_mac:
+                    index = 1
+                    network_label = int_name.partition(" ")[2]
+                    while target_name in used_names:
+                        target_name = f"vNIC{index} {network_label}"
+                        index += 1
+                used_names.add(target_name)
+                if int_name not in names_by_mac:
+                    int_data["description"] = target_name
+                int_data["name"] = target_name
+                remapped_data[target_name] = int_data
+                remapped_ips[target_name] = nic_ips.get(int_name, [])
+            nic_data = remapped_data
+            nic_ips = remapped_ips
 
         # map interfaces of existing object with discovered interfaces
         nic_object_dict = self.map_object_interfaces_to_current_interfaces(device_vm_object, nic_data)
@@ -671,11 +800,18 @@ class OVirtHandler(SourceBase):
                 log.error(f"Primary IPv6 ({p_ipv6}) does not appear to be a valid IP address (needs included suffix).")
 
         for int_name, int_data in nic_data.items():
+            existing_interface = nic_object_dict.get(int_name)
+            if existing_interface is not None:
+                existing_name = grab(existing_interface, "data.name")
+                if existing_name is not None and (
+                        object_type == NBDevice or existing_interface in mac_matched_interfaces):
+                    int_data["name"] = existing_name
+                if object_type == NBDevice:
+                    int_data.pop("type", None)
 
             # add/update interface with retrieved data
             nic_object, ip_address_objects = self.add_update_interface(nic_object_dict.get(int_name), device_vm_object,
-                                                                       int_data, nic_ips.get(int_name, list()),
-                                                                       keep_undiscovered_ips=keep_undiscovered_ips)
+                                                                       int_data, nic_ips.get(int_name, list()))
 
             # add all interface IPs
             for ip_object in ip_address_objects:
@@ -727,129 +863,88 @@ class OVirtHandler(SourceBase):
 
         return device_vm_object
 
-    def add_object_to_cache(self, vm_object, netbox_object):
+    def add_object_to_cache(self, obj_type, key, netbox_object):
 
-        if None in [vm_object, netbox_object]:
+        if obj_type is None or key is None or netbox_object is None:
             return
 
-        vm_class_name = vm_object.__class__.__name__
-        vm_object_id = vm_object.id
+        # noinspection PyBroadException
+        try:
+            vm_class_name = obj_type.__name__
+        except Exception:
+            return
 
         if self.object_cache.get(vm_class_name) is None:
             self.object_cache[vm_class_name] = dict()
 
-        self.object_cache[vm_class_name][vm_object_id] = netbox_object
+        self.object_cache[vm_class_name][key] = netbox_object
 
-    def get_object_from_cache(self, vm_object):
+    def get_object_from_cache(self, obj_type, key):
 
-        if vm_object is None:
+        if obj_type is None or key is None:
             return
 
-        vm_class_name = vm_object.__class__.__name__
-        vm_object_id = vm_object.id
+        # noinspection PyBroadException
+        try:
+            vm_class_name = obj_type.__name__
+        except Exception:
+            return
 
         if self.object_cache.get(vm_class_name) is None:
             return
 
-        return self.object_cache[vm_class_name].get(vm_object_id)
-
-    def add_datacenter(self, obj):
-        """
-        Add a oVirt datacenter as a NBClusterGroup to NetBox
-
-        Parameters
-        ----------
-        obj: types.DataCenter
-            datacenter object
-
-        """
-        if self.settings.set_source_name_as_cluster_group is True:
-            name = self.name
-        else:
-            name = get_string_or_none(grab(obj, "name"))
-
-        if name is None:
-            return
-
-        log.debug(f"Parsing oVirt datacenter: {name}")
-
-        object_data = {"name": name}
-
-        if self.settings.set_source_name_as_cluster_group is True:
-            label = "Datacenter Name"
-            custom_field = self.add_update_custom_field({
-                "name": f"ovirt_{label}",
-                "label": label,
-                "object_types": ["virtualization.clustergroup"],
-                "type": "text",
-                "description": f"oVirt '{self.name}' synced custom attribute '{label}'"
-            })
-
-            object_data["custom_fields"] = {
-                grab(custom_field, "data.name"): get_string_or_none(grab(obj, "name"))
-            }
-
-        self.add_object_to_cache(obj, self.inventory.add_update_object(NBClusterGroup, data=object_data, source=self))
+        return self.object_cache[vm_class_name].get(key)
 
     def add_cluster(self, obj):
         """
-        Add a oVirt Cluster as a NBCluster to NetBox. Cluster name is checked against
+        Add a OpenStack Availability Zone as a NBCluster to NetBox. Cluster name is checked against
         cluster_include_filter and cluster_exclude_filter config setting. Also adds
         cluster and site_name to "self.permitted_clusters" so hosts and VMs can be
         checked if they are part of a permitted cluster.
 
         Parameters
         ----------
-        obj: types.Cluster
+        obj: openstack.compute.v2.availability_zone.AvailabilityZone
             cluster to add
         """
 
         name = get_string_or_none(grab(obj, "name"))
-        if self.settings.set_source_name_as_cluster_group is True:
-            group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
-        else:
-            group = self.get_object_from_cache(obj.data_center)
+        group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.settings.group_name})
 
         if name is None or group is None:
             return
 
         group_name = grab(group, "data.name")
-        full_cluster_name = f"{group_name}/{name}"
 
-        log.debug(f"Parsing oVirt Cluster: {full_cluster_name}")
+        log.debug(f"Parsing OpenStack AZ: {name}")
 
-        # check for full name and then for cluster name only
-        include = self.settings.cluster_include_filter
-        exclude = self.settings.cluster_exclude_filter
-        if (include is not None and not any(include.match(value) for value in (full_cluster_name, name))) or \
-                (exclude is not None and any(exclude.match(value) for value in (full_cluster_name, name))):
+        if self.passes_filter(name, self.settings.cluster_include_filter,
+                              self.settings.cluster_exclude_filter) is False:
             return
 
-        site_name = self.get_site_name(NBCluster, full_cluster_name)
+        site_name = self.get_site_name(NBCluster, name)
 
         data = {
             "name": name,
-            "type": {"name": "oVirt"},
-            "group": group
+            "type": {"name": "Openstack"},
+            "group": group,
+            "site": {"name": site_name}
         }
         if version.parse(self.inventory.netbox_api_version) >= version.parse("4.2.0"):
-            data["scope_type"] = "dcim.site"
-            data["scope_id"] = self.inventory.add_update_object(NBSite, data={"name": site_name})
-        else:
-            data["site"] = {"name": site_name}
+            data.pop("site")
+            data["scope_type"] = NBSite.object_type
+            data["scope_id"] = self.inventory.add_update_object(NBSite, data={"name": site_name}, source=self)
+        tags = self.get_object_relation(name, "cluster_tag_relation")
+        if tags:
+            data["tags"] = tags
 
-        tenant_name = self.get_object_relation(full_cluster_name, "cluster_tenant_relation")
+        tenant_name = self.get_object_relation(name, "cluster_tenant_relation")
         if tenant_name is not None:
             data["tenant"] = {"name": tenant_name}
-
-        cluster_tags = self.get_object_relation(full_cluster_name, "cluster_tag_relation")
-        if len(cluster_tags) > 0:
-            data["tags"] = cluster_tags
 
         # try to find cluster including cluster group
         log.debug2("Trying to find a matching existing cluster")
         cluster_object = None
-        fallback_cluster_object = None
         for cluster_candidate in self.inventory.get_all_items(NBCluster):
             if grab(cluster_candidate, "data.name") != name:
                 continue
@@ -858,6 +953,10 @@ class OVirtHandler(SourceBase):
                 continue
 
             # try to find a cluster with matching site
+            candidate_group = grab(cluster_candidate, "data.group.data.name")
+            if candidate_group not in (None, group_name):
+                continue
+
             if cluster_candidate.get_site_name() == site_name:
                 cluster_object = cluster_candidate
                 log.debug2("Found an existing cluster where 'name' and 'site' are matching")
@@ -876,27 +975,22 @@ class OVirtHandler(SourceBase):
                 log.debug2("Found an existing cluster where 'name' and 'tenant' are matching")
                 break
 
-            # if only the name matches and there are multiple cluster with the same name we choose the first
-            # cluster returned from netbox. This needs to be done to not ignore possible matches in one of
-            # the next iterations
-            if fallback_cluster_object is None:
-                fallback_cluster_object = cluster_candidate
-
-        if cluster_object is None and fallback_cluster_object is not None:
-            log.debug2(f"Found an existing cluster where 'name' "
-                       f"matches (NetBox id: {fallback_cluster_object.get_nb_reference()})")
-            cluster_object = fallback_cluster_object
-
         if cluster_object is not None:
             cluster_object.update(data=data, source=self)
         else:
             cluster_object = self.inventory.add_update_object(NBCluster, data=data, source=self)
 
-        self.add_object_to_cache(obj, cluster_object)
+        self.add_object_to_cache(NBCluster, name, cluster_object)
+
+        self.cluster_host_map[name] = self.get_compute_host_names(grab(obj, "hosts"))
+        log.debug2(f"Found compute hosts for availability zone '{name}': "
+                   f"{self.cluster_host_map[name]}")
+
+        self.permitted_clusters[name] = site_name
 
     def add_host(self, obj):
         """
-        Parse a oVirt host to NetBox once all data is gathered.
+        Parse a Openstack host to NetBox once all data is gathered.
 
         First host is filtered:
              host has a cluster and is it permitted
@@ -905,57 +999,56 @@ class OVirtHandler(SourceBase):
 
         Then all necessary host data will be collected.
 
-        Primary IPv4/6 will be determined by 'address' value
-        Other IP's are listed in the 'network attachments'
+        Primary IPv4/6 will be determined by 'host_ip' value
 
         Parameters
         ----------
-        obj: types.Host
+        obj: Hypervisor
             host object to parse
         """
 
         name = get_string_or_none(grab(obj, "name"))
+        if name is None:
+            return
 
         if name is not None and self.settings.strip_host_domain_name is True:
             name = name.split(".")[0]
 
         # parse data
-        log.debug(f"Parsing oVirt host: {name}")
+        log.debug(f"Parsing Openstack host: {name}")
 
         #
         # Filtering
         #
 
         # manage site and cluster
-        cluster_object = obj.cluster
+        short_name = get_string_or_none(obj.service_details["host"])
+        cluster_name = self.get_cluster_for_host(short_name)
 
-        if cluster_object is None:
-            log.error(f"Requesting cluster for host '{name}' failed. Skipping.")
+        if cluster_name is None:
+            # Nova omits disabled compute services from availability zone host lists
+            if get_string_or_none(grab(obj, "status")) == "disabled":
+                log.info(f"Host '{name}' is disabled in Nova and not part of any availability zone. Skipping.")
+            else:
+                log.error(f"Unable to find an availability zone for host '{name}'. Skipping.")
             return
 
         if log.level == DEBUG3:
             try:
                 log.info("Cluster data")
-                dump(cluster_object)
+                dump(obj.service_details.to_dict())
             except Exception as e:
                 log.error(e)
 
-        # get cluster object
-        nb_cluster_object = self.get_object_from_cache(cluster_object)
-
-        if nb_cluster_object is None:
+        if self.permitted_clusters.get(cluster_name) is None:
             log.debug(f"Host '{name}' is not part of a permitted cluster. Skipping")
             return
 
-        cluster_name = get_string_or_none(grab(nb_cluster_object, "data.name"))
+        # get cluster object
+        nb_cluster_object = self.get_object_from_cache(NBCluster, cluster_name)
 
         # get a site for this host
-        if self.settings.set_source_name_as_cluster_group is True:
-            group = self.inventory.get_by_data(NBClusterGroup, data={"name": self.name})
-        else:
-            group = grab(nb_cluster_object, "data.group")
-        group_name = grab(group, "data.name")
-        site_name = self.get_site_name(NBDevice, name, f"{group_name}/{cluster_name}")
+        site_name = self.get_site_name(NBDevice, name, cluster_name)
 
         if name in self.processed_host_names.get(site_name, list()):
             log.warning(f"Host '{name}' for site '{site_name}' already parsed. "
@@ -977,10 +1070,9 @@ class OVirtHandler(SourceBase):
         #
 
         # collect all necessary data
-        manufacturer = get_string_or_none(grab(obj, "hardware_information.manufacturer"))
-        model = get_string_or_none(grab(obj, "hardware_information.product_name"))
-        platform = " ".join(str(value) for value in (
-            grab(obj, "os.type"), grab(obj, "os.version.full_version")) if value is not None) or None
+        manufacturer = None
+        model = None
+        platform = get_string_or_none(obj.hypervisor_type)
 
         # if the device vendor/model cannot be retrieved (due to problem on the host),
         # set a dummy value so the host still gets synced
@@ -991,14 +1083,8 @@ class OVirtHandler(SourceBase):
 
         # get status
         status = "offline"
-        if obj.status == types.HostStatus.UP:
+        if get_string_or_none(obj.status) == "enabled" and grab(obj, "state", fallback="up") == "up":
             status = "active"
-
-        # try to find serial
-        serial = get_string_or_none(grab(obj, "hardware_information.uuid"))
-
-        # add asset tag if desired and present
-        asset_tag = get_string_or_none(grab(obj, "hardware_information.serial_number"))
 
         # get host_tenant_relation
         tenant_name = self.get_object_relation(name, "host_tenant_relation")
@@ -1021,286 +1107,267 @@ class OVirtHandler(SourceBase):
         }
 
         # add data if present
-        if serial is not None:
-            host_data["serial"] = serial
-        if asset_tag is not None:
-            host_data["asset_tag"] = asset_tag
         if platform is not None:
             host_data["platform"] = {"name": platform}
         if tenant_name is not None:
             host_data["tenant"] = {"name": tenant_name}
         if len(host_tags) > 0:
             host_data["tags"] = host_tags
-        self.add_custom_attributes(obj, host_data, NBDevice)
+        self.add_custom_attributes(NBDevice, obj, host_data)
 
-        # Get all NICs information
         pnic_data_dict = dict()
-        vnic_data_dict = dict()
+        pnic_data = {
+                "name": "eth0",
+                "enabled": True,
+                "type": "virtual"
+        }
+        pnic_data_dict["eth0"] = pnic_data
+
+        ip_addr = grab(obj, "host_ip")
+        if ip_addr is not None and not self.settings.permitted_subnets.permitted(ip_addr, interface_name="eth0"):
+            ip_addr = None
+        prefix = None
+        matched_prefix = None
+        if ip_addr is not None:
+            matched_prefix = self.return_longest_matching_prefix_for_ip(ip_interface(ip_addr), site_name)
+            if matched_prefix is None:
+                matched_prefix = self.return_longest_matching_prefix_for_ip(ip_interface(ip_addr))
+        if matched_prefix is not None:
+            prefix = matched_prefix.data["prefix"].prefixlen
+            ip_addr = f"{ip_addr}/{prefix}"
+
         vnic_ips = dict()
+        vnic_ips["eth0"] = list()
+        if ip_addr is not None:
+            ip_addr = str(ip_interface(ip_addr))
+            vnic_ips["eth0"].append(ip_addr)
 
-        host_primary_ip4 = None
-        host_primary_ip6 = None
-        host_address = get_string_or_none(grab(obj, "address"))
-        host_addresses = set()
-        if host_address is not None:
-            try:
-                host_addresses.add(ip_address(host_address))
-            except ValueError:
-                try:
-                    host_addresses.update(
-                        ip_address(result[4][0])
-                        for result in socket.getaddrinfo(host_address, None, type=socket.SOCK_STREAM)
-                    )
-                except (OSError, ValueError) as e:
-                    log.warning(f"Unable to resolve oVirt host address '{host_address}': {e}")
-
-        for nic in obj.nics or []:
-            nic_type = "other"
-            if nic.speed:
-                nic_type = NetBoxInterfaceType(nic.speed / 1000000).get_this_netbox_type()
-
-            mac_address = None
-            if nic.mac:
-                mac_address = normalize_mac_address(grab(nic, "mac.address"))
-            if nic.base_interface is None and nic.bonding is None:
-                # Physical Interface
-                pnic_data = {
-                    "name": nic.name,
-                    "device": None,
-                    "enabled": (nic.status == types.NicStatus.UP),
-                    "type": nic_type,
-                    "mtu": nic.mtu,
-                    "mac_address": mac_address
-                }
-                pnic_data_dict[nic.name] = pnic_data
-            elif nic.bonding is not None:
-                # Bond
-                vnic_data = {
-                    "name": nic.name,
-                    "device": None,
-                    "enabled": (nic.status == types.NicStatus.UP),
-                    "type": "virtual",
-                    "mtu": nic.mtu,
-                    "mac_address": mac_address
-                }
-                vnic_data_dict[nic.name] = vnic_data
-            else:
-                # Bridge
-                vnic_data = {
-                    "name": nic.name,
-                    "device": None,
-                    "enabled": (nic.status == types.NicStatus.UP),
-                    "type": "virtual",
-                    "mtu": nic.mtu,
-                    "mac_address": mac_address
-                }
-                if nic.vlan is not None:
-                    vnic_data["tagged_vlans"] = [{
-                        "name": f"VLAN-{nic.vlan.id}",
-                        "vid": nic.vlan.id,
-                        "site": {
-                            "name": site_name
-                        }}]
-                vnic_data_dict[nic.name] = vnic_data
-            # IP Info
-            if nic.ip is not None and nic.ip.address is not None and nic.ip.netmask is not None:
-                int_v4 = "{}/{}".format(nic.ip.address, nic.ip.netmask)
-                vnic_name = nic.name
-                if vnic_ips.get(vnic_name) is None:
-                    vnic_ips[vnic_name] = list()
-
-                if self.settings.permitted_subnets.permitted(int_v4, interface_name=vnic_name) is True:
-                    vnic_ips[vnic_name].append(int_v4)
-
-                    if host_primary_ip4 is None and ip_address(nic.ip.address) in host_addresses:
-                        host_primary_ip4 = int_v4
-
-            if nic.ipv6 is not None and nic.ipv6.address is not None and nic.ipv6.netmask is not None:
-                int_v6 = "{}/{}".format(nic.ipv6.address, nic.ipv6.netmask)
-                vnic_name = nic.name
-                if vnic_ips.get(vnic_name) is None:
-                    vnic_ips[vnic_name] = list()
-
-                if self.settings.permitted_subnets.permitted(int_v6, interface_name=vnic_name) is True:
-                    vnic_ips[vnic_name].append(int_v6)
-                    if host_primary_ip6 is None and ip_address(nic.ipv6.address) in host_addresses:
-                        host_primary_ip6 = int_v6
+        host_primary_ip4 = ip_addr if ip_addr is not None and ip_interface(ip_addr).version == 4 else None
+        host_primary_ip6 = ip_addr if ip_addr is not None and ip_interface(ip_addr).version == 6 else None
 
         # add host to inventory
-        self.add_device_vm_to_inventory(NBDevice, object_data=host_data, pnic_data=pnic_data_dict,
-                                        vnic_data=vnic_data_dict, nic_ips=vnic_ips,
-                                        p_ipv4=host_primary_ip4, p_ipv6=host_primary_ip6, ovirt_object=obj)
+        host = self.add_device_vm_to_inventory(NBDevice, object_data=host_data, pnic_data=pnic_data_dict,
+                                              vnic_data=dict(), nic_ips=vnic_ips,
+                                              p_ipv4=host_primary_ip4, p_ipv6=host_primary_ip6)
+        self.add_object_to_cache(NBDevice, short_name, host)
 
         return
 
+    def add_volume(self, obj):
+        """
+        Parse OpenStack volume and store in in a map.
+        """
+
+        id = obj.id
+        size = obj.size
+
+        self.volume_map[id] = size
+
     def add_virtual_machine(self, obj):
-        """Sync a VM, including stopped VMs without host or guest-agent data."""
-        name = get_string_or_none(obj.name)
+        """
+        Parse a OpenStack VM add to NetBox once all data is gathered.
+
+        Parameters
+        ----------
+        obj: openstack.compute.v2.server.Server
+            virtual machine object to parse
+        """
+
+        name = get_string_or_none(grab(obj, "name"))
         if name is None:
-            log.error(f"VM '{obj.id}' has no name. Skipping.")
             return
+
         if name is not None and self.settings.strip_vm_domain_name is True:
             name = name.split(".")[0]
 
-        vm_uuid = obj.id
         if self.settings.set_vm_name_to_uuid:
-            name = vm_uuid
-        log.debug(f"Parsing oVirt VM: {name}")
-        status = "active" if obj.status == types.VmStatus.UP else "offline"
-        nb_cluster_object = self.get_object_from_cache(obj.cluster)
-        if nb_cluster_object is None:
+            name = get_string_or_none(obj.id)
+
+        log.debug(f"Parsing OpenStack VM: {name}")
+
+        # get VM power state
+        status = "active" if get_string_or_none(obj.status) == "ACTIVE" else "offline"
+
+        cluster_name = get_string_or_none(obj.availability_zone)
+
+        # check VM cluster
+        if cluster_name is None:
+            log.error(f"Requesting cluster for Virtual Machine '{name}' failed. Skipping.")
+            return
+
+        elif self.permitted_clusters.get(cluster_name) is None:
             log.debug(f"Virtual machine '{name}' is not part of a permitted cluster. Skipping")
             return
-        group_name = grab(nb_cluster_object, "data.group.data.name")
-        cluster_name = grab(nb_cluster_object, "data.name")
-        cluster_full_name = f"{group_name}/{cluster_name}"
-        if name in self.processed_vm_names.get(cluster_full_name, []) and \
-                vm_uuid not in self.processed_vm_uuid:
-            log.warning(f"Virtual machine '{name}' for cluster '{cluster_full_name}' already parsed. "
+
+        nb_cluster_object = self.get_object_from_cache(NBCluster, cluster_name)
+
+        if name in self.processed_vm_names.get(cluster_name, list()):
+            log.warning(f"Virtual machine '{name}' for cluster '{cluster_name}' already parsed. "
                         "Make sure to use unique VM names. Skipping")
             return
 
+        # add host to processed list
+        if self.processed_vm_names.get(cluster_name) is None:
+            self.processed_vm_names[cluster_name] = list()
+
+        self.processed_vm_names[cluster_name].append(name)
+
+        # filter VMs by name
         if self.passes_filter(name, self.settings.vm_include_filter, self.settings.vm_exclude_filter) is False:
             return
-        self.processed_vm_names.setdefault(cluster_full_name, []).append(name)
-        self.processed_vm_uuid.append(vm_uuid)
 
-        site_name = nb_cluster_object.get_site_name()
-        api_version = version.parse(self.inventory.netbox_api_version)
+        #
+        # Collect data
+        #
+
+        site_name = self.get_site_name(NBCluster, cluster_name)
+        flavor = dict(grab(obj, "flavor") or {})
+        if not all(key in flavor for key in ("vcpus", "ram", "disk")) and flavor.get("id"):
+            flavor = self.session.compute.get_flavor(flavor["id"]).to_dict()
+        # first check against vm_platform_relation
+        platform = None
+        if self.settings.skip_vm_platform is False:
+            platform = get_string_or_none(flavor.get("original_name") or flavor.get("name"))
+
+            if platform is not None:
+                platform = self.get_object_relation(platform, "vm_platform_relation", fallback=platform)
+
+        disks = {}
+        if grab(obj, "image") and flavor.get("disk"):
+            disks["root"] = int(flavor["disk"])
+        if flavor.get("ephemeral"):
+            disks["ephemeral"] = int(flavor["ephemeral"])
+        disk_complete = True
+        for volume in grab(obj, "attached_volumes", fallback=[]) or []:
+            size = self.volume_map.get(volume["id"])
+            if size is None:
+                log.warning(f"Volume '{volume['id']}' of VM '{name}' was not discovered; preserving disk size.")
+                disk_complete = False
+            disks[volume["id"]] = int(size) if size is not None else None
+
+        annotation = None
+        if self.settings.skip_vm_comments is False:
+            if not self.settings.set_vm_name_to_uuid:
+                annotation = get_string_or_none(obj.id)
+
+        # assign vm_tenant_relation
         tenant_name = self.get_object_relation(name, "vm_tenant_relation")
-        vm_tags = self.get_object_relation(name, "vm_tag_relation")
+
         vm_data = {
             "name": name,
             "cluster": nb_cluster_object,
             "status": status,
-            "memory": int(obj.memory / 1024**2) if obj.memory is not None else None,
         }
-        cores = grab(obj, "cpu.topology.cores")
-        sockets = grab(obj, "cpu.topology.sockets")
-        if cores is not None and sockets is not None:
-            vm_data["vcpus"] = cores * sockets
-        if api_version >= version.parse("3.3.0"):
+        if flavor.get("vcpus"):
+            vm_data["vcpus"] = float(flavor["vcpus"])
+        if flavor.get("ram") is not None:
+            vm_data["memory"] = int(flavor["ram"])
+        if disk_complete and version.parse(self.inventory.netbox_api_version) < version.parse("3.7.0"):
+            vm_data["disk"] = sum(disks.values())
+        tags = self.get_object_relation(name, "vm_tag_relation")
+        if tags:
+            vm_data["tags"] = tags
+        host = self.get_object_from_cache(NBDevice, grab(obj, "compute_host"))
+        if host is not None and version.parse(self.inventory.netbox_api_version) >= version.parse("3.3.0"):
+            vm_data["device"] = host
+
+        # Add adaption for change in NetBox 3.3.0 VM model
+        # issue: https://github.com/netbox-community/netbox/issues/10131#issuecomment-1225783758
+        if version.parse(self.inventory.netbox_api_version) >= version.parse("3.3.0"):
             vm_data["site"] = {"name": site_name}
-        if api_version >= version.parse("4.1.0"):
-            vm_data["serial"] = vm_uuid
-        host_object = self.get_object_from_cache(obj.host)
-        if host_object is not None:
-            vm_data["device"] = host_object
-        if self.settings.skip_vm_platform is False:
-            platform = " ".join(str(value) for value in (
-                grab(obj, "guest_operating_system.distribution"),
-                grab(obj, "guest_operating_system.version.full_version")) if value).strip() or None
-            if platform is not None:
-                platform = self.get_object_relation(platform, "vm_platform_relation", fallback=platform)
-                vm_data["platform"] = {"name": platform}
-        if self.settings.skip_vm_comments is False and not self.settings.set_vm_name_to_uuid:
-            vm_data["comments"] = vm_uuid
+        if platform is not None:
+            vm_data["platform"] = {"name": platform}
+        if annotation is not None:
+            vm_data["comments"] = annotation
         if tenant_name is not None:
             vm_data["tenant"] = {"name": tenant_name}
-        if len(vm_tags) > 0:
-            vm_data["tags"] = vm_tags
 
-        self.add_custom_attributes(obj, vm_data, NBVM)
         if self.settings.set_vm_name_to_uuid:
             custom_field = self.add_update_custom_field({
-                "name": "ovirt_vm_name",
-                "label": "name",
-                "object_types": ["virtualization.virtualmachine"],
-                "type": "text",
-                "description": f"oVirt '{self.name}' synced object attribute 'name'",
-            })
-            vm_data.setdefault("custom_fields", {})[custom_field.data["name"]] = obj.name
-
-        disk_data = []
-        total_disk = 0
-        disk_sizes_complete = True
-        for attachment in obj.disk_attachments or []:
-            disk = self.disk_cache.get(attachment.disk.id)
-            size = grab(disk, "provisioned_size")
-            if size is None:
-                log.warning(f"VM '{name}' disk '{attachment.disk.id}' has no provisioned size. Skipping disk.")
-                disk_sizes_complete = False
-                continue
-            total_disk += size
-            unit = 1024**2 if api_version >= version.parse("4.1.0") else 1024**3
-            disk_data.append({
-                "name": grab(disk, "alias") or grab(disk, "name") or attachment.disk.id,
-                "size": max(1, int(size / unit)),
-            })
-        if api_version < version.parse("3.7.0") and disk_sizes_complete:
-            vm_data["disk"] = int(total_disk / 1024**3)
+                    "name": "openstack_vm_name",
+                    "label": "name",
+                    "object_types": ["virtualization.virtualmachine"],
+                    "type": "text",
+                    "description": f"Openstack '{self.name}' synced object attribute 'name'"
+                })
+            vm_data["custom_fields"] = {
+                grab(custom_field, "data.name"): get_string_or_none(grab(obj, "name"))
+            }
+        self.add_custom_attributes(NBVM, obj, vm_data)
 
         vm_primary_ip4 = None
         vm_primary_ip6 = None
-        vm_nic_dict = {}
-        nic_ips = {}
-        nic_names_by_mac = {}
-        for nic in obj.nics or []:
-            mac = normalize_mac_address(grab(nic, "mac.address"))
-            vm_nic_dict[nic.name] = {
-                "name": nic.name, "mac_address": mac, "enabled": nic.plugged is not False,
-            }
-            if mac is not None:
-                nic_names_by_mac[mac] = nic.name
+        vm_primary_ip4_is_fixed = False
+        vm_primary_ip6_is_fixed = False
+        vm_nic_dict = dict()
+        nic_ips = dict()
+        count = 0
 
-        for reporteddevice in obj.reported_devices or []:
-            if reporteddevice.type != types.ReportedDeviceType.NETWORK:
-                continue
-            nic = reporteddevice.name
-            mac = normalize_mac_address(grab(reporteddevice, "mac.address"))
-            hardware_name = nic_names_by_mac.get(mac)
-            if hardware_name is not None and hardware_name != nic:
-                vm_nic_dict.pop(hardware_name, None)
-            vm_nic_dict[nic] = {
-                "name": nic, "mac_address": mac, "description": nic, "enabled": True,
-            }
-            for ip in reporteddevice.ips or []:
+        for network, addresses in (grab(obj, "addresses") or {}).items():
+            default_mac = next((address.get("OS-EXT-IPS-MAC:mac_addr") for address in addresses
+                                if address.get("OS-EXT-IPS-MAC:mac_addr")), None)
+            interfaces = {}
+            for address in addresses:
+                mac = address.get("OS-EXT-IPS-MAC:mac_addr") or default_mac
+                if mac not in interfaces:
+                    count += 1
+                    full_name = unquote(f"vNIC{count} ({network})")
+                    interfaces[mac] = full_name
+                    vm_nic_dict[full_name] = {
+                        "name": full_name,
+                        "description": full_name,
+                        "enabled": True,
+                    }
+                    if mac:
+                        vm_nic_dict[full_name]["mac_address"] = normalize_mac_address(mac)
+                    nic_ips[full_name] = []
+                full_name = interfaces[mac]
                 try:
-                    address = ip_address(ip.address)
-                except ValueError:
-                    log.warning(f"VM '{name}' reported invalid address '{ip.address}'. Skipping address.")
+                    ip_addr = str(ip_interface(address["addr"]))
+                except (KeyError, ValueError):
+                    log.warning(f"Invalid address on OpenStack VM '{name}'; skipping.")
                     continue
-                matched_prefix = self.return_longest_matching_prefix_for_ip(address, site_name)
+                if not self.settings.permitted_subnets.permitted(ip_addr, interface_name=full_name):
+                    continue
+
+                matched_prefix = self.return_longest_matching_prefix_for_ip(ip_interface(ip_addr), site_name)
                 if matched_prefix is None:
-                    matched_prefix = self.return_longest_matching_prefix_for_ip(address)
-                ip_addr = str(address)
+                    matched_prefix = self.return_longest_matching_prefix_for_ip(ip_interface(ip_addr))
                 if matched_prefix is not None:
-                    this_prefix = grab(matched_prefix, "data.prefix")
-                    ip_addr = f"{ip_addr}/{this_prefix.prefixlen}"
-                if self.settings.permitted_subnets.permitted(ip_addr, interface_name=nic) is True:
-                    nic_ips.setdefault(nic, []).append(ip_addr)
-                    if address.version == 4 and vm_primary_ip4 is None:
-                        vm_primary_ip4 = ip_addr
-                    if address.version == 6 and vm_primary_ip6 is None:
-                        vm_primary_ip6 = ip_addr
+                    prefix = matched_prefix.data["prefix"].prefixlen
+                    ip_addr = f"{ip_interface(ip_addr).ip}/{prefix}"
+
+                nic_ips[full_name].append(ip_addr)
+                is_fixed = address.get("OS-EXT-IPS:type") == "fixed"
+                if ip_interface(ip_addr).version == 4 and (
+                        vm_primary_ip4 is None or (is_fixed and not vm_primary_ip4_is_fixed)):
+                    vm_primary_ip4 = ip_addr
+                    vm_primary_ip4_is_fixed = is_fixed
+                if ip_interface(ip_addr).version == 6 and (
+                        vm_primary_ip6 is None or (is_fixed and not vm_primary_ip6_is_fixed)):
+                    vm_primary_ip6 = ip_addr
+                    vm_primary_ip6_is_fixed = is_fixed
+
+        # add VM to inventory
+        vm = self.add_device_vm_to_inventory(NBVM, object_data=vm_data, vnic_data=vm_nic_dict,
+                                            nic_ips=nic_ips, p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6)
+        if version.parse(self.inventory.netbox_api_version) >= version.parse("3.7.0"):
+            for disk_name, disk_size in disks.items():
+                data = {"name": disk_name, "virtual_machine": vm}
+                existing = next((disk for disk in vm.get_virtual_disks()
+                                 if disk.data.get("name") == disk_name), None)
+                if disk_size is None:
+                    if existing is not None:
+                        existing.update(data=data, source=self)
+                    continue
+                multiplier = 1000 if version.parse(self.inventory.netbox_api_version) >= version.parse("4.1.0") else 1
+                data["size"] = disk_size * multiplier
+                if existing is None:
+                    self.inventory.add_object(NBVirtualDisk, data=data, source=self)
                 else:
-                    log.debug(f"Virtual machine '{name}' address '{ip_addr}' is not valid to add. Skipping")
+                    existing.update(data=data, source=self)
 
-        nbvm = self.add_device_vm_to_inventory(
-            NBVM, object_data=vm_data, vnic_data=vm_nic_dict, nic_ips=nic_ips,
-            p_ipv4=vm_primary_ip4, p_ipv6=vm_primary_ip6, ovirt_object=obj,
-            keep_undiscovered_ips=not bool(obj.reported_devices))
-        if api_version >= version.parse("3.7.0"):
-            for data in disk_data:
-                data["virtual_machine"] = nbvm
-                self.inventory.add_update_object(NBVirtualDisk, data=data, source=self)
-
-    def add_custom_attributes(self, obj, data, object_type):
-        attributes = self.settings.host_custom_object_attributes if object_type == NBDevice \
-            else self.settings.vm_custom_object_attributes
-        for attribute in attributes or []:
-            value = grab(obj, attribute)
-            if value is None:
-                log.debug(f"oVirt object '{obj.id}' has no custom attribute '{attribute}'.")
-                continue
-            field = self.add_update_custom_field({
-                "name": f"ovirt_{attribute}",
-                "label": attribute,
-                "object_types": [object_type.object_type],
-                "type": "text",
-                "description": f"oVirt '{self.name}' synced object attribute '{attribute}'",
-            })
-            data.setdefault("custom_fields", {})[field.data["name"]] = str(value)
+        return
 
     def update_basic_data(self):
         """
@@ -1313,8 +1380,8 @@ class OVirtHandler(SourceBase):
         # add source identification tag
         self.inventory.add_update_object(NBTag, data={
             "name": self.source_tag,
-            "description": f"Marks objects synced from oVirt '{self.name}' "
-                           f"({self.settings.url}) to this NetBox Instance."
+            "description": f"Marks objects synced from Openstack '{self.name}' "
+                           f"({self.settings.auth_url}) to this NetBox Instance."
         })
 
         # update virtual site if present
@@ -1324,7 +1391,7 @@ class OVirtHandler(SourceBase):
             this_site_object.update(data={
                 "name": self.site_name,
                 "comments": "A default virtual site created to house objects "
-                            "that have been synced from this oVirt instance "
+                            "that have been synced from this Openstack instance "
                             "and have no predefined site assigned."
             })
 
