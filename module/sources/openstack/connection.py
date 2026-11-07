@@ -214,29 +214,54 @@ class OpenStackHandler(SourceBase):
             self._server_snapshot_ids = None
 
     def can_reassign_stale_ip(self, ip, device_vm_object):
-        if self._server_snapshot_ids is None or not self.settings.all_projects:
+        def blocked(reason):
+            log.warning(
+                f"OpenStack source '{self.name}': stale IP repair blocked for "
+                f"'{ip.data['address']}' (NetBox IP ID {ip.nb_id}): {reason}."
+            )
             return False
+
+        if self._server_snapshot_ids is None:
+            return blocked("no complete server UUID snapshot is available")
+        if not self.settings.all_projects:
+            return blocked("all_projects is False; absence from this project does not prove deletion")
         old_vm = ip.get_device_vm()
         if not isinstance(old_vm, NBVM) or not isinstance(device_vm_object, NBVM):
-            return False
-        if old_vm.source is not None or device_vm_object.source is not self:
-            return False
+            return blocked("both owners must be virtual machines")
+        if old_vm.source is not None:
+            return blocked(
+                f"old VM '{old_vm.get_display_name()}' (NetBox VM ID {old_vm.nb_id}) "
+                f"was claimed this run by source '{getattr(old_vm.source, 'name', None)}'"
+            )
+        if device_vm_object.source is not self:
+            return blocked("the target VM is not owned by this source in this run")
         for item in (ip, old_vm):
             source_tags = {tag for tag in item.get_tags() if tag.startswith("Source: ")}
             if source_tags != {self.source_tag}:
-                return False
+                return blocked(
+                    f"{item.name} '{item.get_display_name()}' (NetBox ID {item.nb_id}) has "
+                    f"source tags {sorted(source_tags)}; expected only '{self.source_tag}'"
+                )
         if ip.source is not None and ip.source is not self:
-            return False
+            return blocked(f"IP was claimed by another source '{getattr(ip.source, 'name', None)}'")
         identity_key = "name" if self.settings.set_vm_name_to_uuid else "comments"
-        try:
-            old_id = str(UUID(str(old_vm.data.get(identity_key))))
-            current_id = str(UUID(str(device_vm_object.data.get(identity_key))))
-        except ValueError:
-            return False
+        identities = []
+        for vm in (old_vm, device_vm_object):
+            try:
+                identities.append(str(UUID(str(vm.data.get(identity_key)))))
+            except ValueError:
+                return blocked(
+                    f"VM '{vm.get_display_name()}' (NetBox VM ID {vm.nb_id}) has no valid "
+                    f"server UUID in '{identity_key}'"
+                )
+        old_id, current_id = identities
         address = str(ip_interface(ip.data["address"]).ip)
-        if old_id in self._server_snapshot_ids or current_id not in self._server_snapshot_ids or \
-                self._server_ip_counts[address] != 1:
-            return False
+        if old_id in self._server_snapshot_ids:
+            return blocked(f"old server UUID {old_id} is still present in discovery")
+        if current_id not in self._server_snapshot_ids:
+            return blocked(f"target server UUID {current_id} is absent from discovery")
+        if self._server_ip_counts[address] != 1:
+            return blocked(f"{self._server_ip_counts[address]} discovered servers report this IP; expected one")
         log.info(
             f"Reclaiming OpenStack IP '{ip.data['address']}' (NetBox ID {ip.nb_id}) from VM "
             f"'{old_vm.get_display_name()}' (UUID {old_id}), absent from the complete server snapshot, "
