@@ -31,7 +31,11 @@ log = get_logger()
 
 
 def json_safe(value):
-    """Convert AWS timestamps to UTC ISO 8601 strings for NetBox JSON fields."""
+    """
+    boto3 returns timestamps (EKS createdAt, modifiedAt, ...) as datetime objects. A NetBox
+    JSON field only takes plain JSON, so store them as ISO 8601 strings in UTC; the local
+    timezone of the host running the sync must not change the stored value.
+    """
     if isinstance(value, dict):
         return {key: json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -338,9 +342,9 @@ class AWSHandler(SourceBase):
         return f"{name[:limit - 13]}-{suffix}"
 
     def service_object(self, object_type, identity, data):
-        data = {**data, "custom_fields": {
-            **data["custom_fields"], "aws_metadata": json_safe(data["custom_fields"]["aws_metadata"]),
-        }}
+        """Adopt tagged legacy objects; EC2 VMs carry aws_instance_id, not aws_resource_id."""
+        fields = data["custom_fields"]
+        fields["aws_metadata"] = json_safe(fields["aws_metadata"])
         items = self.inventory.get_all_items(object_type)
         matches = [item for item in items
                    if (item.data.get("custom_fields") or {}).get("aws_resource_id") == identity]
