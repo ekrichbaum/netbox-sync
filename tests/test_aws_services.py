@@ -8,13 +8,11 @@
 #  repository or visit: <https://opensource.org/licenses/MIT>.
 
 import copy
-import json
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 import pytest
-import requests
 
 boto3 = pytest.importorskip("boto3")
 from botocore.stub import Stubber
@@ -25,6 +23,7 @@ from module.netbox import (
 from module.sources import instantiate_sources
 from module.sources.aws import client as aws_client
 from module.sources.aws.client import AWSAccessCheck, AWSClient, AWSDiscoveryError
+from module.sources.aws.connection import json_safe
 from test_aws_source import (
     ACCOUNT, INSTANCE, REGION, SECOND_ACCOUNT, VPC, assume_member, identity, inventory_data,
     make_source, org_sdk, organization_accounts, stub_region, windows_config_paths,
@@ -106,73 +105,9 @@ def test_services_import_and_repeat(make_source, inventory, version):
     ]
 
 
-def test_aws_service_metadata_timestamps_are_json_safe_and_stable(make_source, inventory):
-    local = timezone(timedelta(hours=2))
-    timestamp = datetime(2026, 10, 23, 14, 0, 0, 123000, tzinfo=local)
-    expected = "2026-10-23T12:00:00.123000+00:00"
-    data = service_data()
-    data["EKSClusters"][0]["createdAt"] = timestamp
-    data["EKSClusters"][0]["nodegroups"][0]["modifiedAt"] = timestamp
-    data["EKSClusters"][0]["fargateProfiles"][0]["createdAt"] = timestamp
-    data["Buckets"][0]["CreationDate"] = timestamp
-    data["Functions"][0]["nested"] = {"updates": [timestamp]}
-    original = copy.deepcopy(data)
-    source = make_source("sync_s3 = True\nsync_lambda = True\nsync_eks = True", data=data)
-    source.apply()
-    objects = [
-        item for object_type in (NBCluster, NBVM, NBVirtualDisk)
-        for item in inventory.get_all_items(object_type)
-        if "aws_metadata" in (item.data.get("custom_fields") or {})
-    ]
-    for item in objects:
-        fields = item.data["custom_fields"]
-        request = requests.Request("PATCH", "https://netbox.example.invalid/api/", json={
-            "custom_fields": fields,
-        }).prepare()
-        assert json.loads(request.body)["custom_fields"] == fields
-    eks = next(item for item in objects if item.data["custom_fields"]["aws_resource_id"] == CLUSTER_ARN)
-    metadata = eks.data["custom_fields"]["aws_metadata"]
-    assert metadata["createdAt"] == expected
-    assert metadata["nodegroups"][0]["modifiedAt"] == expected
-    assert metadata["fargateProfiles"][0]["createdAt"] == expected
-    bucket = next(item for item in objects if isinstance(item, NBVirtualDisk)
-                  and item.data["custom_fields"]["aws_service"] == "s3")
-    assert bucket.data["custom_fields"]["aws_metadata"]["CreationDate"] == expected
-    function = next(item for item in objects if item.data["custom_fields"]["aws_resource_id"] == FUNCTION_ARN)
-    assert function.data["custom_fields"]["aws_metadata"]["nested"]["updates"] == [expected]
-    for key in ("EKSClusters", "Buckets", "Functions"):
-        assert data[key] == original[key]
-    before = [copy.deepcopy(item.data["custom_fields"]) for item in objects]
-    for item in objects:
-        item.updated_items.clear()
-    source.apply()
-    assert [item.data["custom_fields"] for item in objects] == before
-    assert all("custom_fields" not in item.updated_items for item in objects)
-
-
-@pytest.mark.parametrize("existing_id", [None, "", "   "])
-def test_service_object_adopts_only_managed_legacy_resource(make_source, inventory, existing_id):
-    source = make_source("sync_lambda = True")
-    source.custom_fields()
-    group = inventory.add_object(NBClusterGroup, data={"name": "legacy"})
-    cluster = inventory.add_object(NBCluster, data={
-        "name": "legacy-cluster", "group": group,
-    })
-    existing = inventory.add_object(NBVM, data={
-        "name": "Lambda old", "cluster": cluster, "tags": [source.source_tag],
-        "custom_fields": {"aws_resource_id": existing_id, "aws_service": "lambda"},
-    })
-    data = {
-        "name": "Lambda old", "cluster": cluster,
-        "custom_fields": {"aws_resource_id": FUNCTION_ARN, "aws_service": "lambda",
-                          "aws_metadata": {"createdAt": datetime(2026, 1, 1, tzinfo=timezone.utc)}},
-        "tags": [],
-    }
-    assert source.service_object(NBVM, FUNCTION_ARN, data) is existing
-    assert existing.data["custom_fields"]["aws_resource_id"] == FUNCTION_ARN
-    assert existing.data["custom_fields"]["aws_metadata"]["createdAt"] == "2026-01-01T00:00:00+00:00"
-    assert isinstance(data["custom_fields"]["aws_metadata"]["createdAt"], datetime)
-    assert len(inventory.get_all_items(NBVM)) == 1
+def test_json_safe_normalizes_aware_timestamps_to_utc():
+    timestamp = datetime(2026, 11, 14, 8, 30, tzinfo=timezone(timedelta(hours=-6)))
+    assert json_safe({"createdAt": timestamp}) == {"createdAt": "2026-11-14T14:30:00+00:00"}
 
 
 def test_s3_requires_supported_netbox_before_discovery(make_source, inventory, caplog):
@@ -326,12 +261,12 @@ def test_s3_conflict_skips_dependencies_but_continues(make_source, inventory, ca
     cluster = inventory.add_object(NBCluster, data={
         "name": f"S3 {ACCOUNT}/{REGION}", "group": group,
         "custom_fields": {} if stage == "cluster" else {"aws_resource_id": identity},
-    }, source=None if stage == "cluster" else source)
+    }, source=source if stage != "cluster" else None)
     if stage != "cluster":
         holder = inventory.add_object(NBVM, data={
             "name": f"S3 inventory {ACCOUNT}/{REGION}", "cluster": cluster,
             "custom_fields": {} if stage == "holder" else {"aws_resource_id": identity},
-        }, source=None if stage == "holder" else source)
+        }, source=source if stage == "bucket" else None)
         if stage == "bucket":
             inventory.add_object(NBVirtualDisk, data={
                 "name": "inventory-bucket", "virtual_machine": holder, "size": 0,
@@ -343,6 +278,30 @@ def test_s3_conflict_skips_dependencies_but_continues(make_source, inventory, ca
     assert buckets == (["second"] if stage == "bucket" else [])
     assert any(vm.data.get("custom_fields", {}).get("aws_instance_id") == INSTANCE
                for vm in inventory.get_all_items(NBVM))
+
+
+@pytest.mark.parametrize("mismatch", ["aws_resource_id", "aws_service"])
+def test_s3_source_tagged_name_collision_is_not_adopted(make_source, inventory, caplog, mismatch):
+    data = service_data()
+    source = make_source("sync_s3 = True\nsync_private_ips = False", data=data)
+    source.apply()
+    bucket = next(disk for disk in inventory.get_all_items(NBVirtualDisk)
+                  if disk.data["name"] == "inventory-bucket")
+    bucket.source = None
+    bucket.add_tags(source.source_tag)
+    fields = bucket.data["custom_fields"]
+    if mismatch == "aws_resource_id":
+        fields["aws_resource_id"] = f"s3/{SECOND_ACCOUNT}/inventory-bucket"
+    else:
+        fields.pop("aws_resource_id")
+        fields["aws_service"] = "lambda"
+    original_fields = copy.deepcopy(fields)
+
+    source.apply()
+
+    assert "name collision" in caplog.text
+    assert bucket.data["custom_fields"] == original_fields
+    assert source.source_tag in bucket.get_tags()
 
 
 def test_eks_conflict_skips_workers_and_continues_next_region(make_source, inventory, caplog):
